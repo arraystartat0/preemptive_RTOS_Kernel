@@ -1,4 +1,4 @@
-# preemptive_rtos_kernel
+# preemptive RTOS kernel
 
 A preemptive real-time kernel written from scratch for the STM32F302R8 (Cortex-M4).
 
