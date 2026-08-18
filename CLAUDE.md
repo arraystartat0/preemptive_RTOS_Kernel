@@ -107,19 +107,105 @@ for 6–8 tasks, but there is no room to be careless.
 
   - **Grabbed `stm32f303x8.h` first.** Wrong chip, and it would have *seemed* fine
     for a while: `SysTick_IRQn`/`PendSV_IRQn` are core exceptions and identical, and
-    `USART2_IRQn` happens to share a slot. But F302x8 has 59 IRQ entries to F303x8's
-    52, slot 18 is `ADC1_IRQn` not `ADC1_2_IRQn`, and 19/20 are the USB-shared CAN
-    vectors. Would have detonated in Phase 4 when NVIC priorities start mattering.
+    `USART2_IRQn` happens to share a slot. The device IRQ lists diverge, though, so
+    it would have detonated in Phase 4 when NVIC priorities start mattering.
+    (Earlier versions of this note claimed "59 IRQ entries" and that slot 18 is
+    `ADC1_IRQn` not `ADC1_2_IRQn` — both wrong, see the vector table facts below.)
   - **`system_stm32f3xx.h` is required even though `SystemInit` is never called.**
     `stm32f302x8.h` includes it unconditionally; without it the first compile dies.
     The *header* is all that's needed — ST's `system_stm32f3xx.c` from
     `Source/Templates/` was deliberately **not** kept, since it does full PLL setup
     and this project stays on default HSI until much later.
+  - **RM0365 documents two different vector tables.** Table 40 is
+    STM32F302x**B/C/D/E**; Table 41 is STM32F302x**6/8** — the Nucleo's part.
+    Transcribing Table 40 would give TIM3/TIM4 at 29/30, SPI1 at 35, FMC at 48,
+    UART4/5 at 52/53, DMA2 at 56–60 and `COMP1_2_` at 64, none of which exist on
+    this chip. Same failure mode as the F303 header, from a different direction.
+
+### Vector table facts (verified: RM0365 Table 41 vs `IRQn_Type` in `stm32f302x8.h`)
+
+Positions agree exactly between the two sources.
+
+| | |
+|---|---|
+| Core exceptions | 16 (indices 0–15) |
+| Device IRQ slots | 82 (positions 0–81) |
+| Named IRQs | 50 |
+| Reserved slots | 32 |
+| Last vector | position 81 (`FPU`) at offset `0x184` |
+| **Full table** | **98 words = 392 bytes = `0x188`** |
+
+Reserved (need `.word 0`): **29–30, 35, 43–50, 52–53, 55–63, 66–71, 77–80**.
+
+Invariant to check work against: **enum value == table index − 16**. Spot checks:
+`USART2_IRQn` = 38 lands at index 54; `FPU_IRQn` = 81 at index 97, the last entry.
+
+Two transcription traps in Table 41 itself:
+
+- **ST omitted the row for position 66.** The printed table jumps 65 → 67. It is
+  reserved (CMSIS agrees). Copying row-by-row yields a 97-word table with
+  everything after 65 shifted by one — silent, and only visible in Phase 4.
+- **RM acronyms are not CMSIS symbol names.** Positions identical, labels differ:
+  pos 2 `TAMPER_STAMP`/`TAMP_STAMP_IRQn`, 8 `EXTI2_TS`/`EXTI2_TSC_IRQn`,
+  18 `ADC1_2`/`ADC1_IRQn`, 19 `CAN_TX`/`USB_HP_CAN_TX_IRQn`,
+  20 `CAN_RX0`/`USB_LP_CAN_RX0_IRQn`. Use the **CMSIS** names, so that
+  `NVIC_EnableIRQ(USART2_IRQn)` pairs with `USART2_IRQHandler`.
 
 ### In progress
 
-**Phase 0 build plumbing.** Nothing written yet: `linker.ld` exists but is empty,
-`src/` is empty, no `Makefile`, no `openocd.cfg`.
+**Phase 0 build plumbing.** `openocd.cfg`, `linker.ld`, and `startup.s` are done.
+`startup.s` assembles clean with `-Wall -Wextra -Werror`.
+
+What `startup.s` contains and why, so it doesn't have to be re-derived:
+
+- Vector table `g_pfnVectors`: **98 words / 392 bytes**, verified by `readelf`.
+  Full 82-slot IRQ range with reserved slots as `.word 0`; each entry carries its
+  position as a trailing comment. Generated from the `IRQn_Type` enum in
+  `stm32f302x8.h` and then audited back against that enum entry-by-entry — all 98
+  match. Position 66 (the row ST omitted from RM0365 Table 41) is reserved.
+- **Self-checking length assertion** after the table: `.if .-g_pfnVectors != 392` /
+  `.error` / `.endif`. `.` is the location counter, so `.-g_pfnVectors` is an
+  assembly-time constant. Watched to both fire and pass. Reuse this technique for
+  TCB size and stack alignment in Phases 3 and 7.
+  Note it only checks *length* — a shifted-by-one table of the right size passes.
+- `.data` copy and `.bss` zero loops both guard the zero-length case. The `.data`
+  loop branches to its test (`b LoopCopyDataInit`); the `.bss` loop uses the other
+  idiom — a `cmp`/`bcs BSSDone` guard ahead of the body. `bcs`/`bcc` are unsigned
+  (`hs`/`lo`) because these are address comparisons; `blt` would be a latent bug.
+- `HardFault_Handler` has its **own** weak body in its own section (`hardfault_loop`),
+  not aliased to `Default_Handler`, so faults breakpoint distinctly. Its
+  `.thumb_set` line is deleted — a symbol cannot be both label-defined and equated.
+- MemManage/BusFault/UsageFault stay aliased on purpose: they are disabled in
+  `SHCSR` at reset, so those faults escalate to HardFault. Split them in Phase 7
+  when they get enabled.
+
+**Naming rule, which differs across the table:** device IRQs (index ≥ 16) derive
+their handler name from the enum — strip `_IRQn`, append `_IRQHandler`. Core
+exceptions do **not**; those names are conventional and four of nine don't
+correspond (`NonMaskableInt_IRQn`→`NMI_Handler`, `MemoryManagement_IRQn`→
+`MemManage_Handler`, `SVCall_IRQn`→`SVC_Handler`, `DebugMonitor_IRQn`→
+`DebugMon_Handler`). A misspelled handler in C is silent — the weak alias just
+keeps winning. Check the `.map` if a handler never fires.
+
+Remaining, in order:
+
+1. `git mv startup.s src/startup.s` — it is still at the repo root.
+2. `src/main.c`: GPIOA clock on **`AHBENR`**, PA5 output via `MODER`, toggle `ODR`
+   in a `volatile`-counter delay loop.
+3. `Makefile` (the agreed starting point is further down this file). Two Windows
+   traps in it: `mkdir $(BUILD)` fails if `build/` exists — the `| $(BUILD)`
+   order-only prerequisite is what prevents that; and `rmdir /S /Q` in `clean`
+   errors on an already-clean tree.
+
+Nothing has been linked or flashed yet — `bl main` currently resolves to nothing.
+
+**Acceptance test for the startup code**, once it links: put two globals in
+`main.c`, one initialized to a recognizable non-zero constant and one left
+uninitialized. Confirm from the `.map` which section each landed in, break on the
+first instruction of `main`, and check both in GDB. A right value for one and not
+the other isolates the failure to a single loop. Distinguishing "copy loop is
+wrong" from "`_sidata` is wrong in the linker script" is the interesting part —
+both corrupt the same variable.
 
 ### Not started
 
@@ -211,10 +297,9 @@ warning in a context switcher is a hard fault three weeks later.
 
 ## Immediate next steps
 
-1. Finish extracting CMSIS headers; move the Cube clone out; `git init`.
-2. Read ST's `startup_stm32f302x8.s` and a reference `.ld` from the Cube package —
-   **read, then close them.** Write originals.
-3. Write `linker.ld`:
+~~1. Finish extracting CMSIS headers; move the Cube clone out; `git init`.~~ Done.
+~~2. Read ST's `startup_stm32f302x8.s` and a reference `.ld`.~~ Done.
+~~3. Write `linker.ld`.~~ Done — details below kept for reference:
    - `MEMORY`: FLASH `0x08000000` len 64K, RAM `0x20000000` len 16K
    - `.isr_vector` **first** in FLASH — the chip fetches its initial SP from
      `0x08000000` and its reset vector from `0x08000004` before executing anything
@@ -224,12 +309,9 @@ warning in a context switcher is a hard fault three weeks later.
    - `.bss` bracketed by `_sbss`, `_ebss`
    - `_estack` at `0x20004000` (top of RAM)
    - `. = ALIGN(4);` around `.data` and `.bss` — startup copies word-at-a-time
-4. Write `src/startup.s`: vector table (word 0 = `_estack`, word 1 = `Reset_Handler`),
-   `.data` copy loop, `.bss` zero loop, branch to `main`. All other vectors `.weak`
-   aliased to an infinite loop — but give `HardFault_Handler` its **own** loop so it
-   can be breakpointed distinctly. It will be visited often.
-   No `SystemInit` call; clock setup comes later.
-5. Write `src/main.c`: enable GPIOA clock on **AHBENR**, PA5 to output via `MODER`,
+~~4. Write `src/startup.s`.~~ Done — see "In progress" above for what it contains.
+   Still needs `git mv` into `src/`. No `SystemInit` call; clock setup comes later.
+5. **← YOU ARE HERE.** Write `src/main.c`: enable GPIOA clock on **AHBENR**, PA5 to output via `MODER`,
    toggle `ODR` in a `volatile`-counter delay loop.
 6. `make`, then `make flash`. This erases ST's demo firmware, which is disposable.
 7. Connect GDB through OpenOCD, step through `main`.
@@ -284,7 +366,8 @@ beats twenty half-tested APIs.
 
 - **UM1724** — Nucleo-64 board user manual. Already read.
 - **RM0365** — STM32F302 reference manual. The one to live in: RCC, GPIO, USART
-  chapters. Search it, don't read it. **Still needs downloading.**
+  chapters. Search it, don't read it. Obtained. Table 41 is the vector table for
+  this part — **not** Table 40.
 - **Joseph Yiu, _The Definitive Guide to ARM Cortex-M3 and Cortex-M4 Processors_** —
   the exception model chapters.
 - **ARMv7-M Architecture Reference Manual (DDI 0403)** — the authority when Yiu is
@@ -322,9 +405,6 @@ a snippet I'd only have to paste — is not, however boilerplate-ish it looks.
 
 Still fine: throwaway test harnesses and verification scratch code that lives outside
 the project tree and that I'm not meant to learn from, plus edits to this file.
-
-**Fine to write for me:** build plumbing (Makefile, OpenOCD/GDB configs, scripts),
-throwaway test harnesses, anything that isn't the pedagogical point.
 
 Other standing preferences:
 
