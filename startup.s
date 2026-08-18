@@ -377,6 +377,6 @@
         .word FPU_IRQHandler               /* 81 */
     .size g_pfnVectors, .-g_pfnVectors
     /* self assert table if table not 392 bytes long */
-    .if .-g_pfnVectors != 392
+    .if .-g_pfnVectors != ((16 + 82) * 4) // used derivation for 392 bytes: 16 reserved + 82 handlers * 4 bytes per word
         .error "Vector table is not 392 bytes long" 
     .endif
