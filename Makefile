@@ -47,8 +47,11 @@ $(BUILD)/$(TARGET).elf: $(OBJS)
 $(BUILD):
 	mkdir $(BUILD)
 
+# -f openocd.cfg is NOT optional here. OpenOCD only falls back to reading
+# openocd.cfg from the cwd when no -f AND no -c are given; passing -c for the
+# program command suppresses that default and leaves it with no adapter driver.
 flash: $(BUILD)/$(TARGET).elf
-	openocd -c "program $< verify reset exit"
+	openocd -f openocd.cfg -c "program $< verify reset exit"
 
 # Leading '-' tells make to ignore the exit status. cmd's rmdir errors when
 # the directory is already gone, so a second `make clean` would otherwise fail.
