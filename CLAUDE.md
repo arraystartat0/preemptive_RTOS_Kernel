@@ -151,10 +151,19 @@ Two transcription traps in Table 41 itself:
   20 `CAN_RX0`/`USB_LP_CAN_RX0_IRQn`. Use the **CMSIS** names, so that
   `NVIC_EnableIRQ(USART2_IRQn)` pairs with `USART2_IRQHandler`.
 
-### In progress
+### Phase 0 — COMPLETE (verified on hardware, 2026-09-01)
 
-**Phase 0 build plumbing.** `openocd.cfg`, `linker.ld`, and `startup.s` are done.
-`startup.s` assembles clean with `-Wall -Wextra -Werror`.
+Build, step, and print all work. `firmware.elf` is **5552 text / 96 data / 1368 bss**,
+flashed and `** Verified OK **`.
+
+| Criterion | Evidence |
+|---|---|
+| **Build** | `make` works; incremental; `-MMD` header tracking rebuilds only what changed; `make clean` idempotent; `make flash` programs and verifies |
+| **Step** | GDB over OpenOCD: `break main`, `print/x golden_data` → `0xdeadbeef`, `print golden_bss` → `0` |
+| **Print** | `printf("%d\r\n", counter)` streaming to COM3 at 115200 8N1 via the ST-LINK VCP |
+
+The board blinks LD2 on PA5 at ~1.8 Hz (200,000-iteration `volatile` delay loop) while
+printing an incrementing counter.
 
 What `startup.s` contains and why, so it doesn't have to be re-derived:
 
@@ -187,33 +196,136 @@ correspond (`NonMaskableInt_IRQn`→`NMI_Handler`, `MemoryManagement_IRQn`→
 `DebugMon_Handler`). A misspelled handler in C is silent — the weak alias just
 keeps winning. Check the `.map` if a handler never fires.
 
-Remaining, in order:
+**Acceptance test for the startup code: PASSED.** Two globals in `main.c` —
+`golden_data = 0xDEADBEEF` (lands in `.data`, exercises the copy loop) and
+`golden_bss = 0` (lands in `.bss`, exercises the zero loop). Both read correctly in
+GDB at a breakpoint on `main`.
 
-1. `git mv startup.s src/startup.s` — it is still at the repo root.
-2. `src/main.c`: GPIOA clock on **`AHBENR`**, PA5 output via `MODER`, toggle `ODR`
-   in a `volatile`-counter delay loop.
-3. `Makefile` (the agreed starting point is further down this file). Two Windows
-   traps in it: `mkdir $(BUILD)` fails if `build/` exists — the `| $(BUILD)`
-   order-only prerequisite is what prevents that; and `rmdir /S /Q` in `clean`
-   errors on an already-clean tree.
+The whole `.data` chain was also verified statically, without hardware, and that
+technique is worth reusing: `readelf -l` showed the segment's **PhysAddr (LMA)
+`0x0800028c`** matching `_sidata` exactly, and `xxd` on `firmware.bin` at offset
+`0x28c` showed `efbeadde` — `0xDEADBEEF` physically present at the address the copy
+loop reads from. Vector table decoded from `objdump -s -j .isr_vector`: word 0 =
+`0x20004000` (`_estack`), word 1 = `0x08000239` (`Reset_Handler`, thumb bit set),
+HardFault at a *different* address from the three aliased handlers, exactly as designed.
 
-Nothing has been linked or flashed yet — `bl main` currently resolves to nothing.
+**A note on `= 0`:** a global explicitly initialized to zero lands in `.bss`, not
+`.data` — the linker won't waste flash storing zeros. Getting this backwards voids
+the acceptance test, because both variables end up in `.bss` and the copy loop is
+never exercised.
 
-**Acceptance test for the startup code**, once it links: put two globals in
-`main.c`, one initialized to a recognizable non-zero constant and one left
-uninitialized. Confirm from the `.map` which section each landed in, break on the
-first instruction of `main`, and check both in GDB. A right value for one and not
-the other isolates the failure to a single loop. Distinguishing "copy loop is
-wrong" from "`_sidata` is wrong in the linker script" is the interesting part —
-both corrupt the same variable.
+### Phase 0 traps, so they aren't rediscovered
+
+**Toolchain / build**
+
+- **OpenOCD only auto-loads `openocd.cfg` when neither `-f` nor `-c` is given.** The
+  `flash` recipe passes `-c "program ..."`, which suppresses that default. Without an
+  explicit `-f openocd.cfg` you get `Error: Debug Adapter has to be specified`.
+- **Make's recipe shell on Windows depends on PATH.** From PowerShell/cmd it uses
+  `cmd.exe` and `rmdir /S /Q` works. From Git Bash it finds a Unix `rmdir`, `/S` and
+  `/Q` become path arguments, the command fails, and the `-` prefix **silently
+  swallows the error** — `make clean` appears to succeed and deletes nothing. Run
+  `make` from PowerShell. (The `-` that makes a second `clean` safe is the same `-`
+  that hides real failures. That's the trade.)
+- `--specs=nano.specs --specs=nosys.specs` links fine **without** `-nostartfiles`. It
+  emits ~5 linker warnings (`_close`/`_fstat`/`_isatty`/`_lseek`/`_read` "is not
+  implemented and will always fail"). Harmless — libnosys stubs for syscalls nothing
+  calls. `-Werror` lives in `CFLAGS`, not `LDFLAGS`, so they don't fail the build.
+- `printf` costs **~4.6 KB**: 932 → 5552 bytes of text.
+
+**C and compiler**
+
+- `int(expr)` is C++ syntax. C spells a cast `(int)expr` — and `8000000 / 115200` is
+  already integer division, constant-folded to `movs r2, #69`. No float, no runtime
+  division. Note it *truncates*; for baud dividers where the fraction exceeds .5,
+  round with `(num + den/2) / den`.
+- **`printf` with no `%` conversion is rewritten by GCC into `puts`, even at `-O0`.**
+  Verified in the disassembly. A literal-only `printf` therefore does not test the
+  formatting engine at all.
+- newlib's `printf` allocates a stdio buffer via `malloc`, and `nosys.specs`'s
+  `_sbrk` always fails (`malloc`, `_malloc_r`, and `_sbrk` are all genuinely linked
+  into the image). **`setvbuf(stdout, NULL, _IONBF, 0)` before any output** skips the
+  allocation. Call it once, before any I/O on the stream — the C standard makes a
+  later call undefined, so it must not live inside the loop.
+
+**F3 register traps**
+
+- **Three different buses in one file:** GPIO on `AHBENR`, USART2 on `APB1ENR`,
+  USART1 on `APB2ENR`. Copying a USART1 example gets the clock line wrong.
+- The F3 USART is the modern one: status is **`ISR`** (not `SR`), and transmit/receive
+  are **separate `TDR`/`RDR`** (not one `DR`). F1/F4 tutorial code won't compile —
+  which is the header telling the truth.
+- **`BRR` holds USARTDIV directly** at OVER8=0 — no mantissa/fraction split. F1/F4
+  code shifting by 4 is wrong here. 8 MHz / 115200 = **69** (`0x45`), actual 115942
+  baud, +0.64%, well inside the ±2.5% a UART tolerates.
+- The F302x8 has **no `USART2SW`** clock selector — `RCC_CFGR3` only has
+  `USART1SW`. USART2/3 are hardwired to PCLK1. Larger F3 parts (302xC/xE) do have it,
+  so tutorials may show a selector this silicon lacks.
+- **AF numbers come from the datasheet's alternate-function table, not RM0365.** The
+  RM documents the GPIO peripheral; the datasheet says which AF wires which pin to
+  which peripheral on this package. PA2 → **AF7** for USART2_TX.
+- Confirm the clock rather than inheriting it: `RCC->CFGR` reads `0x00000000`, so
+  `SWS`=HSI, `HPRE`=÷1, `PPRE1`=÷1 → **PCLK1 = 8 MHz**. Read it with
+  `print/x RCC->CFGR` in GDB or `mdw 0x40021004` from OpenOCD.
+
+**CMSIS naming, two rules that caused real bugs**
+
+- **Instance pointers carry the number; bit-mask macros do not.** `USART2->ISR` but
+  `USART_ISR_TXE`; `GPIOA->MODER` but `GPIO_MODER_MODER5_Msk`. Register layouts are
+  per-peripheral-*type*, so the masks are defined once for all instances.
+- **`_0` / `_1` suffixes name which bit *of the field*, not the value.**
+  `MODER5_0` is the field's low bit → writes `01` (output). `MODER5_1` is the high bit
+  → writes `10` (alternate function). Four modes: `00` input, `01` output, `10`
+  alternate function, `11` analog.
+- `MODER`/`OSPEEDR`/`PUPDR` are 2 bits per pin (position = pin × 2); `OTYPER`/`IDR`/`ODR`
+  are 1 bit; `AFR[]` is 4 bits (position = pin × 4), split `AFR[0]` = pins 0–7,
+  `AFR[1]` = pins 8–15.
+
+**The bug class `-Werror` cannot catch**
+
+Two real ones happened, both valid C that compiled silently:
+
+- `GPIOA->MODER /= (1 << Pos)` instead of `|=` — divides the register. Would have
+  wiped bits 31:26, dropping PA13/PA14 (SWDIO/SWCLK) from alternate function to
+  input, killing the debug port a few instructions into `main`.
+- `USART2->CR2 |= USART_CR1_UE` — right bit, wrong register. `UE` never gets set, the
+  USART stays off, and every other register looks perfect.
+
+**Countermeasure: after configuring a peripheral, read the registers back in GDB and
+compare against what you intended.** `print/x GPIOA->MODER` should be `0xa8000400`
+after PA5 setup; `print/x USART2->CR1` should have bits 0 and 3 set. The compiler
+cannot know which register you *meant* — only the silicon can tell you.
+
+**Linker script**
+
+- **`.isr_vector` must be the first output section in `SECTIONS`.** `.ARM.extab` and
+  `.ARM` were briefly placed above it. Both were size 0, so `.isr_vector` still landed
+  at `0x08000000` and everything worked — a latent landmine that detonates the moment
+  unwind data appears (C++, `-funwind-tables`). Fixed; keep it first.
+
+### In progress
+
+**Phase 1.** Nothing written yet. Next concrete task: SysTick at 1 kHz with a tick
+counter, then a GPIO driver, then `delay_ms()` spinning on ticks — which is what
+finally deletes the magic `200000` from the `volatile` delay loop.
+
+Two things to carry forward into Phase 1:
+
+- `BRR` is currently the literal expression `8000000 / 115200`. The moment the PLL
+  comes up, PCLK1 stops being 8 MHz and that divisor is wrong. Same for any SysTick
+  reload value derived from an assumed clock.
+- `SystemCoreClock` is *declared* by `system_stm32f3xx.h` but never *defined* —
+  `system_stm32f3xx.c` was deliberately not kept. Using it compiles clean and fails at
+  link. The fix is your own clock constant, **not** adding ST's file back, which does
+  full PLL setup.
 
 ### Not started
 
-Everything below. Next concrete task is **`openocd.cfg`, then `linker.ld`.**
+Phases 2–8.
 
 ---
 
-## Target project layout
+## Project layout (actual, as of end of Phase 0)
 
 ```
 preemptive_rtos_kernel/
@@ -221,14 +333,20 @@ preemptive_rtos_kernel/
 │   ├── Include/                     (core_cm4.h, cmsis_gcc.h, ...)
 │   └── Device/ST/STM32F3xx/Include/ (stm32f302x8.h, stm32f3xx.h)
 ├── src/
-│   ├── main.c
+│   ├── main.c      (checks, blinky, uart2_init/putc, _write, printf)
 │   └── startup.s
 ├── build/          (gitignored)
 ├── linker.ld
 ├── Makefile
 ├── openocd.cfg
+├── CLAUDE.md
+├── README.md
 └── .gitignore      (build/ *.o *.elf *.bin *.map)
 ```
+
+`main.c` will need splitting in Phase 1 — the UART and GPIO code belongs in drivers,
+not next to `main`. Watch the `$(notdir ...)` caveat in the Makefile section if that
+means adding subdirectories under `src/`.
 
 ### openocd.cfg
 
@@ -236,62 +354,56 @@ preemptive_rtos_kernel/
 source [find interface/stlink.cfg]
 transport select swd
 source [find target/stm32f3x.cfg]
-adapter speed 950
+adapter speed 1000
 ```
 
-### Makefile (agreed starting point)
+The ST-LINK only offers fixed divisors, so 1000 gets clamped and every connection
+prints `Unable to match requested speed 1000 kHz, using 950 kHz` twice. Purely
+cosmetic — it clocks at 950 either way. Setting it to 950 silences the noise.
 
-```make
-TARGET  = firmware
-BUILD   = build
+**This file is only loaded automatically when OpenOCD is invoked with neither `-f`
+nor `-c`.** The Makefile's `flash` recipe passes `-c`, so it must also pass
+`-f openocd.cfg` explicitly.
 
-CC      = arm-none-eabi-gcc
-OBJCOPY = arm-none-eabi-objcopy
-SIZE    = arm-none-eabi-size
+### Makefile
 
-CFLAGS  = -mcpu=cortex-m4 -mthumb -mfloat-abi=soft
-CFLAGS += -std=gnu11 -O0 -g3
-CFLAGS += -Wall -Wextra -Werror
-CFLAGS += -ffunction-sections -fdata-sections
-CFLAGS += -Icmsis/Include -Icmsis/Device/ST/STM32F3xx/Include
-CFLAGS += -DSTM32F302x8
+The real file is at `Makefile` in the repo root — no copy is kept here, so it can't go
+stale. **Written by Claude at my explicit request**, unlike every other file in this
+project; the standing no-code rule below still applies to everything else.
 
-LDFLAGS  = -T linker.ld -nostdlib -Wl,--gc-sections
-LDFLAGS += -Wl,-Map=$(BUILD)/$(TARGET).map -Wl,--no-warn-rwx-segments
+Five things it does beyond the original hand-sketched draft, each for a reason:
 
-SRCS = src/main.c src/startup.s
-OBJS = $(addprefix $(BUILD)/,$(notdir $(SRCS:.c=.o)))
-OBJS := $(OBJS:.s=.o)
-
-all: $(BUILD)/$(TARGET).elf
-
-$(BUILD)/%.o: src/%.c | $(BUILD)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(BUILD)/%.o: src/%.s | $(BUILD)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-$(BUILD)/$(TARGET).elf: $(OBJS)
-	$(CC) $(OBJS) $(LDFLAGS) -o $@
-	$(OBJCOPY) -O binary $@ $(BUILD)/$(TARGET).bin
-	$(SIZE) $@
-
-$(BUILD):
-	mkdir $(BUILD)
-
-flash: $(BUILD)/$(TARGET).elf
-	openocd -c "program $< verify reset exit"
-
-clean:
-	rmdir /S /Q $(BUILD)
-```
+1. **`ARCH` as a shared variable** spliced into *both* `CFLAGS` and `LDFLAGS`. The
+   draft had the arch flags on compile only. That works under `-nostdlib` because no
+   libraries get linked — but the moment `printf` pulls in a multilib, the driver uses
+   `-mcpu`/`-mthumb`/`-mfloat-abi` to choose which build of libc to link. Without them
+   on the link line you get float-ABI errors that read like nonsense.
+2. **`-MMD -MP` plus `-include $(DEPS)`.** The draft had no header dependency tracking
+   at all — editing a header rebuilt nothing and you'd link a stale object. GCC writes
+   a `.d` per object listing every header it consumed; make reads them back as extra
+   rules. `-MP` adds phony targets so deleting a header doesn't break the build. (`.s`
+   files produce no `.d` — lowercase `.s` skips the preprocessor — and the leading `-`
+   on `-include` handles the absence silently.)
+3. **`| $(BUILD)` order-only prerequisite.** Two problems in one: cmd's `mkdir` errors
+   if the directory exists, and writing objects into `build/` bumps its mtime so
+   everything would rebuild forever. Order-only means "ensure it exists, ignore its
+   timestamp," so `mkdir` runs exactly once.
+4. **Leading `-` on the `clean` recipe** so a second `make clean` doesn't abort. See
+   the shell-sensitivity trap above for what this also hides.
+5. **`-f openocd.cfg` in the `flash` recipe** — mandatory, see the OpenOCD trap above.
 
 `-O0 -g3` is deliberate: at higher optimization levels GDB lies about variables, and
-this project lives in GDB. `-Werror` from day one is deliberate too — an ignored
-warning in a context switcher is a hard fault three weeks later.
+this project lives in GDB. Note for Phase 8 — a context-switch latency measured at
+`-O0` is not a number worth publishing; measure at `-O2` and say which. `-Werror` from
+day one is deliberate too: an ignored warning in a context switcher is a hard fault
+three weeks later.
 
-`-nostdlib` holds until `printf` is wanted, at which point it becomes
+`-nostdlib` held until Phase 0 step 8 and is now
 `--specs=nano.specs --specs=nosys.specs` plus a hand-written `_write()`.
+
+Known simplification: `OBJS` uses `$(notdir ...)`, which flattens paths. Fine for a
+flat `src/`; it breaks the day `src/kernel/sched.c` and `src/sched.c` both exist.
+Phase 3 is when that becomes likely.
 
 ---
 
@@ -309,25 +421,39 @@ warning in a context switcher is a hard fault three weeks later.
    - `.bss` bracketed by `_sbss`, `_ebss`
    - `_estack` at `0x20004000` (top of RAM)
    - `. = ALIGN(4);` around `.data` and `.bss` — startup copies word-at-a-time
-~~4. Write `src/startup.s`.~~ Done — see "In progress" above for what it contains.
-   Still needs `git mv` into `src/`. No `SystemInit` call; clock setup comes later.
-5. **← YOU ARE HERE.** Write `src/main.c`: enable GPIOA clock on **AHBENR**, PA5 to output via `MODER`,
-   toggle `ODR` in a `volatile`-counter delay loop.
-6. `make`, then `make flash`. This erases ST's demo firmware, which is disposable.
-7. Connect GDB through OpenOCD, step through `main`.
-8. Retarget `_write()` to USART2, get `printf` out the VCP.
+~~4. Write `src/startup.s`.~~ Done — see the Phase 0 section above for what it
+   contains. Now at `src/startup.s`. No `SystemInit` call; clock setup comes later.
+~~5. Write `src/main.c`: GPIOA clock on **AHBENR**, PA5 output via `MODER`, toggle
+   `ODR` in a `volatile`-counter delay loop.~~ Done.
+~~6. `make`, then `make flash`.~~ Done — ST's demo firmware is gone.
+~~7. Connect GDB through OpenOCD, step through `main`.~~ Done — acceptance test passed.
+~~8. Retarget `_write()` to USART2, get `printf` out the VCP.~~ Done.
 
-Steps 6–8 (build, step, print) are Phase 0. Do not move to SysTick until all three
-are frictionless.
+**Steps 6–8 (build, step, print) were Phase 0. All three work. → Phase 1.**
+
+### Phase 1, in order
+
+1. **SysTick at 1 kHz** with a `volatile` tick counter incremented in
+   `SysTick_Handler`. The handler name must match the vector table exactly — a
+   misspelled handler is silent, because the weak alias to `Default_Handler` just
+   keeps winning. Check the `.map` if it never fires.
+2. **`delay_ms()`** spinning on the tick counter. Deletes the magic `200000`.
+3. **A GPIO driver** — the `set_pin(port, pin, state)` layer. Use `BSRR`, not `ODR`:
+   `BSRR` does set and clear as single writes with no read-modify-write window, which
+   stops mattering as style and starts mattering as correctness in Phase 4 when a
+   preemption can land mid-RMW.
+
+Do not derive the SysTick reload value from `SystemCoreClock` — see the note in
+"In progress" above about why that link-errors, and why the fix is not ST's file.
 
 ---
 
 ## Phase plan
 
-| Phase | Content | Est. |
-|---|---|---|
-| **0** | Toolchain, own startup/linker/Makefile, blinky on PA5, GDB, `printf` | weekend |
-| **1** | SysTick at 1 kHz + tick counter, GPIO driver, `delay_ms()` spinning on ticks | weekend |
+| Phase | Content | Est. | Status |
+|---|---|---|---|
+| **0** | Toolchain, own startup/linker/Makefile, blinky on PA5, GDB, `printf` | weekend | ✅ **done** |
+| **1** | SysTick at 1 kHz + tick counter, GPIO driver, `delay_ms()` spinning on ticks | weekend | ← next |
 | **2** | **The context switch.** Two hardcoded tasks alternating on SysTick. No scheduler, no priorities. Prove a task can be left mid-execution and resumed exactly | the hard part |
 | **3** | Task Control Blocks, stack initialization, a real round-robin scheduler, `os_start()` | 1 wk |
 | **4** | Task states (READY/RUNNING/BLOCKED/SUSPENDED), `os_delay()` that yields instead of spinning, fixed-priority preemption, `os_yield()` | 1–2 wk |

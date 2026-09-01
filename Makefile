@@ -19,7 +19,7 @@ CFLAGS += -Icmsis/Include -Icmsis/Device/ST/STM32F3xx/Include
 CFLAGS += -DSTM32F302x8
 
 LDFLAGS  = $(ARCH)
-LDFLAGS += -T linker.ld -nostdlib -Wl,--gc-sections
+LDFLAGS += -T linker.ld --specs=nano.specs --specs=nosys.specs -Wl,--gc-sections
 LDFLAGS += -Wl,-Map=$(BUILD)/$(TARGET).map -Wl,--no-warn-rwx-segments
 
 SRCS = src/main.c src/startup.s
