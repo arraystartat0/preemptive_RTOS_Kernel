@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "uart.h"
+#include "constants.h"
 
 // golden variables to populate the .data and .bss sections
 volatile uint32_t golden_data = 0xDEADBEEF; // This variable is initialized and should be in .data
