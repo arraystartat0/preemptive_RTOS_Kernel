@@ -22,7 +22,7 @@ LDFLAGS  = $(ARCH)
 LDFLAGS += -T linker.ld --specs=nano.specs --specs=nosys.specs -Wl,--gc-sections
 LDFLAGS += -Wl,-Map=$(BUILD)/$(TARGET).map -Wl,--no-warn-rwx-segments
 
-SRCS = src/main.c src/startup.s
+SRCS = src/main.c src/startup.s src/uart.c src/gpio.c src/systick.c 
 OBJS = $(addprefix $(BUILD)/,$(notdir $(SRCS:.c=.o)))
 OBJS := $(OBJS:.s=.o)
 DEPS = $(OBJS:.o=.d)
