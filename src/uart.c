@@ -1,5 +1,6 @@
 #include "uart.h"
 #include "stm32f3xx.h" // dispatcher
+#include <sys/types.h>
 
 
 void uart2_init(void){
@@ -19,10 +20,10 @@ void uart2_putc(char c){
 }
 
 // todo: Understand what this does
-int _write(int fd, const char *buf, int len){
-    for(int i = 0; i < len; i++){
-        uart2_putc(buf[i]);
+int _write(int fd, const void *buf, __ssize_t size_t){
+    for(int i = 0; i < size_t; i++){
+        uart2_putc(((const char *)buf)[i]);
     }
     (void)fd;
-    return len;
+    return size_t;
 }
