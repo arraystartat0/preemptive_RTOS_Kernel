@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "uart.h"
-#include "constants.h"
+#include "systick.h"
 
 // golden variables to populate the .data and .bss sections
 volatile uint32_t golden_data = 0xDEADBEEF; // This variable is initialized and should be in .data
@@ -67,6 +67,7 @@ int main(void){
     GPIOA->MODER |= (1 << GPIO_MODER_MODER5_Pos); // Set pin 5 to output mode
     
     uart2_init();
+    systick_init();
     // todo: understand what this does: and why we couldn't just use printf earlier.
     setvbuf(stdout, NULL, _IONBF, 0);
     int counter = 0;
