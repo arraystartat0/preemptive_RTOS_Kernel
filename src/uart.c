@@ -3,13 +3,15 @@
 #include <sys/types.h>
 #include "clock.h"
 
+#define BAUD_RATE 115200U // Baud rate for UART communication from ST's docs
+
 void uart2_init(void){
     RCC->APB1ENR |= RCC_APB1ENR_USART2EN; // Set bit 17 of RCC->APB1ENR
     GPIOA->MODER &= ~(GPIO_MODER_MODER2_Msk); // clear mode bits for pin 2
     GPIOA->MODER |= (2 << GPIO_MODER_MODER2_Pos); // set pin 2 to alternate function enable
     GPIOA->AFR[0] &= ~GPIO_AFRL_AFRL2_Msk; // clear bits 11:8
     GPIOA->AFR[0] |=  (7 << GPIO_AFRL_AFRL2_Pos); // AF7 = USART2
-    USART2->BRR = PCLK1_HZ / 115200; // baud rate register TODO: understand this derivation again.
+    USART2->BRR = PCLK1_HZ / BAUD_RATE; // baud rate register TODO: understand this derivation again.
     USART2->CR1 |= USART_CR1_TE; // enable transmitter
     USART2->CR1 |= USART_CR1_UE; // enable peripheral
 }

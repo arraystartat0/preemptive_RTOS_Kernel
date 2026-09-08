@@ -293,7 +293,7 @@ Two real ones happened, both valid C that compiled silently:
 
 **Countermeasure: after configuring a peripheral, read the registers back in GDB and
 compare against what you intended.** `print/x GPIOA->MODER` should be `0xa8000400`
-after PA5 setup; `print/x USART2->CR1` should have bits 0 and 3 set. The compiler
+after PA5 setup alone, `0xa8000420` once `uart2_init()` has also put PA2 in AF mode; `print/x USART2->CR1` should have bits 0 and 3 set. The compiler
 cannot know which register you *meant* — only the silicon can tell you.
 
 **Linker script**
@@ -303,21 +303,187 @@ cannot know which register you *meant* — only the silicon can tell you.
   at `0x08000000` and everything worked — a latent landmine that detonates the moment
   unwind data appears (C++, `-funwind-tables`). Fixed; keep it first.
 
+### Phase 1 step 1 - COMPLETE (verified on hardware, 2026-09-07)
+
+SysTick at 1 kHz with a tick counter. `firmware.elf` is **5704 text / 96 data / 1368 bss**.
+
+| Criterion | Evidence |
+|---|---|
+| Vector wired | `x/a 0x0800003c` -> `0x8000531 <SysTick_Handler>` - the weak alias lost |
+| Reload correct | `objdump -d` on `systick_init` shows `movw r2, #7999` (`0x1f3f`) stored to `LOAD` |
+| Registers | `LOAD` = `0x1f3f`, `CTRL` = `0x7`, priority byte at `0xE000ED23` = `0xf0` |
+| Handler runs | `tick_count` advanced **60620** over a stopwatched 60 s |
+| No faults | `CFSR` (`0xE000ED28`) = 0, `$sp` = `0x20003ff0` (16 B below `_estack`) |
+
+**The clock tree is now derived, not hand-maintained.** `constants.h` is gone, replaced
+by `clock.h`. Three *independent* inputs - `SYSCLK_HZ`, `HPRE_DIV`, `PPRE1_DIV` - and
+everything else (`HCLK_HZ`, `PCLK1_HZ`, the SysTick reload, the UART `BRR`) derives by
+division. Enabling the PLL later becomes a two-number edit instead of an archaeology
+exercise. Ceilings are asserted (SYSCLK/HCLK <= 72 MHz, PCLK1 <= 36 MHz) and so is
+exactness at **every** division node - if `SYSCLK % HPRE` truncates, `HCLK_HZ` is
+already a lie and the tick assert below it validates that lie.
+
+`PCLK2_HZ` was written first and deleted: it referenced an undefined `PPRE2_DIV` and
+compiled cleanly **because nothing used it**. Macros are not evaluated until expanded,
+so a broken one with zero consumers is invisible - same failure shape as the
+`.isr_vector` ordering landmine. Either define it or delete it; never leave it
+half-built. There is no APB2 consumer on this project yet.
+
+### PLL: investigated, deliberately deferred until after Phase 2
+
+- On the F302x8, `PLLSRC` is a **one-bit** field - HSI/2 or HSE/PREDIV. There is no way
+  to feed HSI to the PLL undivided. `PLLMUL` maxes at x16, so **8 / 2 x 16 = 64 MHz is
+  the ceiling reachable from HSI**; 72 MHz requires HSE. Larger F3 parts have a 2-bit
+  `PLLSRC` with an `HSI/PREDIV` option this silicon lacks - same trap shape as the
+  missing `USART2SW`.
+- **`HPRE` skips 32.** Legal divisors are 1, 2, 4, 8, 16, **64**, 128, 256, 512
+  (`RCC_CFGR_HPRE_DIV16` = `0xB0` jumps straight to `DIV64` = `0xC0`). A power-of-two
+  assert would wave 32 through. `PPRE1`/`PPRE2` stop at 16.
+- **APB1 maxes at 36 MHz**, so a 64 MHz SYSCLK forces `PPRE1 = /2` and PCLK1 becomes
+  32 MHz. `BRR` derives from **PCLK1**, not SYSCLK - this is the classic "UART prints
+  garbage after enabling the PLL" bug.
+- **Timers on APB1 are clocked at PCLK1 x 2 whenever `PPRE1 != 1`.** An easy 2x error
+  if a general-purpose timer is ever used for measurement. `DWT->CYCCNT` counts the
+  core clock and sidesteps it - the right instrument for Phase 8 latency numbers.
+- Order is mandatory: flash latency (0 WS <=24 MHz, 1 WS <=48, 2 WS <=72) -> `PLLON` ->
+  poll `PLLRDY` -> switch `SW` -> poll `SWS` to confirm.
+- **Deferred on purpose.** Nothing in Phases 1-3 is clock-bound (a 1 ms tick is 8000
+  cycles; a context switch is low hundreds). Changing the clock risks the UART, which
+  is the primary observability channel, immediately before the hardest debugging in
+  the project. The switcher is clock-independent, so there is no rework penalty for
+  waiting. Do it as a standalone task **between Phase 2 and Phase 3**.
+- **NUCLEO-64 HSE caveat:** the X3 crystal footprint ships **unpopulated**; HSE is fed
+  from the ST-LINK's MCO by default. Check UM1724 6.7 before planning around it.
+
+### ms <-> ticks: option B (public APIs take ticks)
+
+Chosen shape: `MS_TO_TICKS` is public and applied **at the call site** -
+`delay_ticks(MS_TO_TICKS(250))`. Same as FreeRTOS's `pdMS_TO_TICKS`, which matters
+because the Phase 5 plan is to diff against their port. The verbosity is the feature:
+it keeps the quantisation visible instead of letting callers assume 1 tick = 1 ms.
+
+- **`MS_TO_TICKS` rounds UP; `TICKS_TO_MS` truncates.** A delay promises "*at least*
+  this long" - truncation at 100 Hz turns a 5 ms delay into 0 ticks, i.e. a task that
+  never yields. A *measurement* must not round up, or it systematically overstates.
+- Ceiling idiom: add **D - 1** to the numerator before dividing by D. Written as
+  `MS_PER_SECOND - 1U`, not a literal `999U`, so it tracks the divisor. It is the
+  largest addend that cannot carry a zero remainder and the smallest that carries
+  every nonzero one - `+1000` breaks exact multiples, `+0` truncates sub-tick delays.
+- **`MS_PER_SECOND` is named separately from `TICK_RATE_HZ`.** Both are 1000 today and
+  mean entirely unrelated things (ms/s, an SI fact, vs ticks/s, a policy choice that
+  will change). Units: `[ms] x [ticks/s] / [ms/s] = [ticks]`.
+- Overflow: the multiply happens first, capping `ms` at `(0xFFFFFFFF - 999) / 1000` =
+  **4294966**. Not runtime-checkable - an overflow has already wrapped by the time you
+  could inspect the result.
+- Reasons `TICK_RATE_HZ` will actually change: tick overhead (a 200-cycle scheduler
+  pass is 2.5% of the CPU at 8 MHz), or finer resolution for the Phase 8 demo.
+
+### The bug class `-Werror` cannot catch - macro arithmetic (Phase 1 additions)
+
+**Three** silently-wrong values in one file, all valid C:
+
+- **`%` typed where `/` was meant** in the reload value. `8000000 % 1000` is 0, then
+  unsigned `0 - 1` wraps to `0xFFFFFFFF`. `LOAD` keeps 24 bits -> `0xFFFFFF` -> a
+  **2.097 s** tick period, 2097x too slow. Confirmed via `objdump`:
+  `mov.w r2, #4294967295`.
+- **The assert that would have caught it had been disarmed** in the same edit -
+  swapped from `<= 0xFFFFFF` to `!= 0`, which passes on `0xFFFFFFFF`, while its
+  message still read `"exceeds 24 bits"`.
+- **Precedence.** `(((ms) * TICK_RATE_HZ) + 999U / 1000U)` - `/` binds tighter than
+  `+`, so it parses as `(ms * RATE) + 0`. The unit conversion vanished entirely and
+  **`make` still passed**, because nothing in `src/` calls the macro.
+
+Rules that came out of it:
+
+- **An assert and the value it guards must be edited independently.** Change both in
+  one motion and you have written one thing twice, not two things that cross-check.
+- **An assert whose condition and message disagree is worse than no assert** - it
+  reads like coverage. Believe neither half when they drift.
+- **Failure modes are additive, not alternatives.** The reload needs `!= 0` *and*
+  `<= 0xFFFFFF` *and* exactness. Trading one for another was done twice.
+- Parenthesize every macro body **as a whole**, and every operand. The preprocessor
+  pastes text; C's precedence rules then apply to the result, not to what you meant.
+- **A green `make` proves nothing about code with no callers.**
+
+### Verification techniques worth reusing
+
+- **`objdump -d` the linked function and read the constant that actually reaches the
+  register.** Caught the `0xFFFFFFFF` and confirmed `movw r2, #7999`. Works with no
+  board attached. Same family as the Phase 0 `.data` LMA check.
+- **To test compile-time logic whose real configuration makes it degenerate:** include
+  the real header, `#undef` the constant, redefine it, then `_Static_assert` the
+  results. Macro bodies expand at *use* time, so this re-points the shipped macro at a
+  new configuration rather than testing a copy. At 1 kHz `MS_TO_TICKS` is the identity
+  function and untestable in-project; at 100 Hz and 300 Hz it is not. **Test truncation
+  cases *and* exact-multiple cases** - they catch opposite bugs (`+0` vs `+D`). Reuse
+  for TCB size and stack alignment in Phases 3 and 7.
+- **`compare-sections` in GDB** verifies flash matches the ELF. Run it before trusting
+  any register readback - "source file is more recent than executable" is a real
+  warning.
+
+### SysTick facts (ARM's peripheral, not ST's)
+
+- SysTick lives in the **System Control Space at `0xE000E010`** - it is ARM's, defined
+  by the ARMv7-M ARM and documented in **PM0214**, not RM0365 (which only mentions
+  that the external reference clock is HCLK/8). Definitions come from `core_cm4.h`,
+  **not** the device header. There is no RCC enable bit for it.
+- It runs *nothing*. Peripherals are clocked by the RCC tree; SysTick is a consumer of
+  HCLK sitting alongside the CPU.
+- Registers: `CTRL` (bit 0 ENABLE, 1 TICKINT, 2 CLKSOURCE, 16 COUNTFLAG), `LOAD`,
+  `VAL`, `CALIB`.
+- **Period is `LOAD + 1` cycles** - the counter includes 0. Hence `HCLK/rate - 1`.
+- **`CLKSOURCE` and the reload value are one decision in two places.** Cleared means
+  HCLK/8, and the reload would be 8x wrong with no error anywhere.
+- Writing `VAL` clears the counter to 0 *and* clears COUNTFLAG - it does not load what
+  you wrote. Writing `LOAD` while running takes effect at the next wrap. Order must be
+  `LOAD` -> `VAL` -> `CTRL`.
+- **COUNTFLAG is read-clear, and a GDB read clears it.** Do not poll it if you use the
+  interrupt. Seeing `0x10007` then `0x7` on two reads is the flag doing its job.
+- `SysTick_IRQn` is **-1**, so `NVIC_SetPriority` dispatches to `SCB->SHP`, not
+  `NVIC->IP`. The byte is at `0xE000ED23`; with `__NVIC_PRIO_BITS` = 4 the value is
+  shifted into the high nibble, so priority 15 reads as **`0xf0`**.
+- Lowest priority is deliberate - a tick handler must never delay a device interrupt.
+  Same reasoning puts PendSV at the bottom in Phase 2.
+
+### Debug-session facts learned the hard way
+
+- **SysTick stops counting while the core is halted in debug.** `VAL` frozen at a
+  breakpoint is *expected*, not a fault. Any tick-based interval measured across a
+  halt undercounts. This makes "stopwatch + breakpoint" self-contradictory for rate
+  measurement, and makes breakpoint-to-breakpoint deltas the *right* way to measure
+  execution time.
+- **The `200000` spin loop actually takes 274 ms, not the predicted 250** - about 11
+  cycles/iteration rather than 10. The remainder is the unbuffered `printf`, roughly
+  87 us per character at 115200.
+- **Stopwatch-vs-tick cannot resolve better than ~1%.** Reaction time is +/-0.83% over
+  60 s and HSI is +/-1%. The 60620/60 s reading is *consistent with* 1 kHz and proves
+  nothing finer. A real number needs a better reference - an argument for HSE.
+- In gdb, a `static` file-scope variable needs the file qualifier:
+  `print 'systick.c'::tick_count`. `tick_count` is at `0x20000064`.
+- **`(gdb)` and `>` in notes are prompts, not part of the command.** For a one-shot
+  from PowerShell: `arm-none-eabi-gdb -batch -ex "x/a 0x0800003c" build/firmware.elf`.
+
 ### In progress
 
-**Phase 1.** Nothing written yet. Next concrete task: SysTick at 1 kHz with a tick
-counter, then a GPIO driver, then `delay_ms()` spinning on ticks — which is what
-finally deletes the magic `200000` from the `volatile` delay loop.
+**Phase 1, steps 2-3.** Step 1 is done and verified above.
 
-Two things to carry forward into Phase 1:
+- **`delay_ticks`** - takes ticks (option B). Two correctness points: the wait
+  comparison must **subtract** (`now - start`), never build a deadline by adding -
+  `tick_count` wraps at 2^32 (~49.7 days) and an added deadline lands on the wrong side
+  of the wrap, returning instantly. And waiting for N tick boundaries only guarantees
+  *more than N-1* periods, because the call arrives mid-period; **wait N+1** to
+  guarantee "at least N". Keep that `+1` **out** of `MS_TO_TICKS` - it is about *when
+  you called*, not about units. Do not claim the name `os_delay`; Phase 4 needs it for
+  the blocking version, and the difference must stay visible.
+- **GPIO driver** - `gpio.c` is still an empty file. `BSRR`, not `ODR`.
+- `main.c` still spins on `200000` and still toggles via `ODR ^=`.
 
-- `BRR` is currently the literal expression `8000000 / 115200`. The moment the PLL
-  comes up, PCLK1 stops being 8 MHz and that divisor is wrong. Same for any SysTick
-  reload value derived from an assumed clock.
-- `SystemCoreClock` is *declared* by `system_stm32f3xx.h` but never *defined* —
+Carried forward, still true:
+
+- `SystemCoreClock` is *declared* by `system_stm32f3xx.h` but never *defined* -
   `system_stm32f3xx.c` was deliberately not kept. Using it compiles clean and fails at
-  link. The fix is your own clock constant, **not** adding ST's file back, which does
-  full PLL setup.
+  link. The fix is `clock.h`, **not** adding ST's file back.
+- `115200` is still a bare literal in `uart.c`; the `BRR` derivation is still a TODO.
 
 ### Not started
 
@@ -325,7 +491,7 @@ Phases 2–8.
 
 ---
 
-## Project layout (actual, as of end of Phase 0)
+## Project layout (actual, as of Phase 1 step 1)
 
 ```
 preemptive_rtos_kernel/
@@ -333,8 +499,14 @@ preemptive_rtos_kernel/
 │   ├── Include/                     (core_cm4.h, cmsis_gcc.h, ...)
 │   └── Device/ST/STM32F3xx/Include/ (stm32f302x8.h, stm32f3xx.h)
 ├── src/
-│   ├── main.c      (checks, blinky, uart2_init/putc, _write, printf)
-│   └── startup.s
+│   ├── clock.h     (SYSCLK/HPRE/PPRE1 inputs; HCLK_HZ + PCLK1_HZ derived; asserts)
+│   ├── gpio.c      (EMPTY - Phase 1 step 3)
+│   ├── main.c      (.data/.bss acceptance checks, blinky, printf loop)
+│   ├── startup.s
+│   ├── systick.c   (reload value + its 3 asserts, init, handler, get_tick_count)
+│   ├── systick.h   (TICK_RATE_HZ, MS_PER_SECOND, MS_TO_TICKS, TICKS_TO_MS, decls)
+│   ├── uart.c      (uart2_init, uart2_putc, _write)
+│   └── uart.h
 ├── build/          (gitignored)
 ├── linker.ld
 ├── Makefile
@@ -344,9 +516,19 @@ preemptive_rtos_kernel/
 └── .gitignore      (build/ *.o *.elf *.bin *.map)
 ```
 
-`main.c` will need splitting in Phase 1 — the UART and GPIO code belongs in drivers,
-not next to `main`. Watch the `$(notdir ...)` caveat in the Makefile section if that
-means adding subdirectories under `src/`.
+`constants.h` was deleted; `clock.h` replaces it. Still a flat `src/`, so the
+`$(notdir ...)` caveat in the Makefile section has not bitten yet - it will if
+Phase 3 adds `src/kernel/`.
+
+**The .h/.c split rule being applied here:** C has no access control. `#include` is
+literal text substitution, and a macro defined in a `.c` has no linkage and never
+reaches the object file. So "private" is enforced *only* by which file you type it in.
+Test: does anything outside this module need it? `TICK_RATE_HZ` and the conversions
+are public contract -> header. `SYSTICK_RELOAD_VALUE` is the arithmetic that happens to
+satisfy that contract, and only `systick.c` programs `LOAD` -> `.c`. **An assert lives
+with the thing it guards**, which is why the clock-tree exactness asserts sit in
+`clock.h` and the reload asserts sit in `systick.c`. Once the reload moved out,
+`systick.h` needed nothing from `clock.h` and the include went with it.
 
 ### openocd.cfg
 
@@ -433,11 +615,13 @@ Phase 3 is when that becomes likely.
 
 ### Phase 1, in order
 
-1. **SysTick at 1 kHz** with a `volatile` tick counter incremented in
-   `SysTick_Handler`. The handler name must match the vector table exactly — a
-   misspelled handler is silent, because the weak alias to `Default_Handler` just
-   keeps winning. Check the `.map` if it never fires.
-2. **`delay_ms()`** spinning on the tick counter. Deletes the magic `200000`.
+~~1. **SysTick at 1 kHz** with a `volatile` tick counter.~~ **Done - verified on
+   hardware.** Note the `.map` alone only proves the symbol *exists*; to prove the
+   table *points at it*, read slot 15 (exception number 15 -> byte offset `0x3C`) with
+   `x/a 0x0800003c`. Expect an **odd** address - bit 0 is the T-bit, and an even
+   vector entry takes a UsageFault/`INVSTATE` that escalates to HardFault.
+2. **`delay_ticks()`** spinning on the tick counter. Deletes the magic `200000`.
+   Named for its unit, not `delay_ms` - under option B it takes ticks.
 3. **A GPIO driver** — the `set_pin(port, pin, state)` layer. Use `BSRR`, not `ODR`:
    `BSRR` does set and clear as single writes with no read-modify-write window, which
    stops mattering as style and starts mattering as correctness in Phase 4 when a
@@ -453,7 +637,7 @@ Do not derive the SysTick reload value from `SystemCoreClock` — see the note i
 | Phase | Content | Est. | Status |
 |---|---|---|---|
 | **0** | Toolchain, own startup/linker/Makefile, blinky on PA5, GDB, `printf` | weekend | ✅ **done** |
-| **1** | SysTick at 1 kHz + tick counter, GPIO driver, `delay_ms()` spinning on ticks | weekend | ← next |
+| **1** | SysTick at 1 kHz + tick counter, GPIO driver, `delay_ticks()` spinning on ticks | weekend | step 1 ✅ — steps 2–3 ← **here** |
 | **2** | **The context switch.** Two hardcoded tasks alternating on SysTick. No scheduler, no priorities. Prove a task can be left mid-execution and resumed exactly | the hard part |
 | **3** | Task Control Blocks, stack initialization, a real round-robin scheduler, `os_start()` | 1 wk |
 | **4** | Task states (READY/RUNNING/BLOCKED/SUSPENDED), `os_delay()` that yields instead of spinning, fixed-priority preemption, `os_yield()` | 1–2 wk |
