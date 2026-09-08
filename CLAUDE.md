@@ -329,6 +329,122 @@ so a broken one with zero consumers is invisible - same failure shape as the
 `.isr_vector` ordering landmine. Either define it or delete it; never leave it
 half-built. There is no APB2 consumer on this project yet.
 
+### Phase 1 step 2 - COMPLETE (verified on hardware, 2026-09-08)
+
+`delay_ticks()` in its own module (`delay.c` / `delay.h`). The magic `200000` is gone
+from `main.c`; the blink is now `delay_ticks(MS_TO_TICKS(250))`.
+`firmware.elf` is **5824 text / 96 data / 1368 bss**.
+
+| Criterion | Evidence |
+|---|---|
+| In the image | `nm` -> `08000574 T delay_ticks`; text moved 5704 -> 5824 |
+| Right instructions | `objdump -d`: `subs r3, r2, r3` (elapsed = now - start), `adds r3, #1` (boundary), `bcc` (unsigned), `bkpt 0x0000` |
+| Wrap-safe | `set var 'systick.c'::tick_count = 0xFFFFFFF0` immediately before a 251-boundary wait; read back **235**. `0xFFFFFFF0 + 251 = 0x1000000EB`, mod 2^32 = `0xEB` = 235 - it rolled through zero *mid-delay* and still waited the full length |
+| Guard fires | `set var SysTick->CTRL = 0` -> `is_systick_initialized()` returns `false` -> `call delay_ticks(10)` stops with `SIGTRAP` on the `__BKPT` |
+| Live frame | Ctrl+C mid-delay: `ticks`=250, target=251, `start`=15563, `current`=15584, `elapsed`=21 |
+
+Shape that survived review:
+
+- Lives in **`delay.c`, not `systick.c`**. SysTick is the timer *driver*; a spin-delay
+  is a *consumer* of the tick counter. `delay.c` knows only `get_tick_count()` and
+  `is_systick_initialized()` - never the reload value.
+- **`delay_ticks` does not call `systick_init`.** An early version did, "in case it
+  wasn't initialised yet". It re-ran init on *every* call, and `SysTick->VAL = 0`
+  resets the *phase* of the global timebase each time, jittering every other consumer.
+  It also **masked the missing boundary `+1`**, because a freshly-reset counter always
+  puts the next tick a full period away. In Phase 3, a task calling that would reset
+  SysTick out from under the scheduler.
+- `ticks == 0` returns immediately, deliberately. `ticks == UINT32_MAX` still makes
+  `ticks + 1` wrap to 0 and return instantly - known, unguarded, written down here.
+- The init check reads **the hardware**, not a flag:
+  `(CTRL & (ENABLE|TICKINT)) == (ENABLE|TICKINT)`. No RAM, no second source of truth,
+  cannot be defeated by a linkage mistake. It answers "is SysTick *running*", which is
+  weaker than "did `systick_init` run" - fine for now; note the gap.
+- On failure it **traps** (`__BKPT(0)`), it does not return. A silent early return
+  converts a visible hang into a wrong-timing bug, the hardest class to diagnose here.
+  With no debugger attached, `BKPT` escalates to HardFault - which already has its own
+  distinct handler from Phase 0, so it is loud either way.
+
+### Phase 1 step 2 traps
+
+**The one that cost the most time: a stale flash image.**
+
+A `printf` HardFault was decoded end to end. `HFSR = 0x40000000` (FORCED),
+`CFSR = 0x8200` (BusFault: `PRECISERR` + `BFARVALID`), `BFAR = 0x40480611`, stacked PC
+`0x0800075a` inside `iprintf`, which does `ldr r0, [r1]` from `0x20000010`
+(`_impure_ptr`) and then `ldr r1, [r0, #8]`. `_impure_ptr` read `0x40480609`; BFAR was
+exactly that + 8. Airtight - and **entirely fictional**. The board was running the
+*previous* binary while the analysis ran against the new ELF. After `make && make
+flash`, `compare-sections` matched, `HFSR` and `CFSR` both read `0`, and the fault
+never recurred. A watchpoint on `0x20000010` never tripped, which was the first real
+clue that the story was wrong.
+
+GDB had been saying so the whole time: **"Source file is more recent than executable."**
+
+> **Rule: `compare-sections` clean before decoding anything.** A fault decode against a
+> mismatched image is not weaker evidence, it is *fabricated* evidence - internally
+> self-consistent, which is exactly why it convinces.
+
+The flash-side check that proved the build was fine is worth reusing: `readelf -l` gave
+the `.data` LMA (`PhysAddr 0x080016c0`), and
+`od -A x -t x4 -j 0x16c0 -N 0x60 build/firmware.bin` showed `20000014` at LMA+0x10 -
+the correct `_impure_ptr` value physically present in flash. Same family as the Phase 0
+`0xDEADBEEF` LMA check.
+
+**`static` in a header - both failure modes, one after the other.**
+
+- `static bool systick_initialized = false;` in `systick.h` gives **every including TU
+  its own private copy**. `systick.c` set its copy; `delay.c` read its own, forever
+  false. No linker error. It surfaced only as `-Werror=unused-variable` in `main.c` -
+  a *symptom*, not the disease. Silence that warning and it builds clean and is
+  silently broken.
+- The "fix" was `volatile uint32_t tick_count = 0;` in `systick.h` - a *definition*
+  with external linkage in a header, so three TUs each defined it:
+  `multiple definition of 'tick_count'`. The linker catches this one.
+
+**Only one of the two is detectable**, from the same root cause: a header must
+*declare*, never *define*. The correct shape was already in the file - object `static`
+in the `.c`, accessor in the `.h`, exactly like `tick_count` / `get_tick_count`.
+
+**`_Static_assert` is compile-time and cannot see runtime state.**
+
+`if (!initialized) { _Static_assert(false, "..."); }` fails the build unconditionally.
+The `if` is irrelevant - the compiler never "reaches" anything, it evaluates the assert
+while parsing. `_Static_assert` takes a *constant expression*; a variable's value never
+is one. The names are the trap: `_Static_assert` is compile-time, `assert()` from
+`<assert.h>` is **runtime**. Newlib's `assert` is unusable here anyway - it calls
+`abort()`, a nosys stub. Runtime traps use `__BKPT` until Phase 7 builds a real one.
+
+**Test for which phase a check belongs to:** could the answer differ between two runs
+of the same binary? `HCLK_HZ % TICK_RATE_HZ` - no, compile time. "Has `systick_init`
+been called?" - yes, runtime.
+
+**`&&` where `&` was meant, plus C's precedence wart.**
+
+`return (CTRL && (MASK) == (MASK));` - `==` binds tighter than `&&`, so it parses as
+`CTRL && (MASK == MASK)`, i.e. `CTRL != 0`. The mask comparison is a tautology and
+vanishes. It *worked by accident* (`CTRL` is 0 at reset, 7 after init) and would have
+failed the day `CTRL` held ENABLE without TICKINT - precisely the case the check exists
+to catch. No warning: `-Wall -Wextra` does not flag comparing two identical constant
+macro expansions.
+
+Changing `&&` to `&` then tripped `-Werror=parentheses`, because **`&` has *lower*
+precedence than `==`** in C. `CTRL & MASK == MASK` is `CTRL & (MASK == MASK)` =
+`CTRL & 1`. It must be `(CTRL & MASK) == MASK`. Note the asymmetry: with `&&` the bug
+was invisible; with `&` GCC has a dedicated warning for it. Third entry in the
+precedence family, after `+ 999U / 1000U`.
+
+**Time was spent debugging a file no compiler had ever seen.** `delay.c` (then
+`time.c`) was not in `SRCS`. Later it *was* in `SRCS` and compiled, but `main.c` never
+called it, so `-ffunction-sections -Wl,--gc-sections` stripped it and the text size
+stayed byte-identical at 5704. **`nm` the ELF for the symbol, and watch the size move.**
+A green `make` still proves nothing.
+
+**`time.c` was renamed to `delay.c`** before it could bite. `<time.h>` is a standard
+header; a `src/time.h` collides the moment `-Isrc` is added - which is exactly what
+Phase 3's `src/kernel/` will require. Harmless now, silent, detonates later: the same
+shape as the `.isr_vector` ordering landmine.
+
 ### PLL: investigated, deliberately deferred until after Phase 2
 
 - On the F302x8, `PLLSRC` is a **one-bit** field - HSI/2 or HSE/PREDIV. There is no way
@@ -462,28 +578,61 @@ Rules that came out of it:
   `print 'systick.c'::tick_count`. `tick_count` is at `0x20000064`.
 - **`(gdb)` and `>` in notes are prompts, not part of the command.** For a one-shot
   from PowerShell: `arm-none-eabi-gdb -batch -ex "x/a 0x0800003c" build/firmware.elf`.
+- **A watchpoint halts the target by itself** - no Ctrl+C. `watch *(uint32_t *)ADDR`,
+  then `continue`; it stops on the write and prints old/new values. Check the word
+  **"Hardware"** in GDB's confirmation: this chip has 4 DWT comparators, so it runs at
+  full speed. A plain "Watchpoint" means GDB fell back to software single-stepping.
+  A watchpoint that *never trips* while the symptom still occurs is real evidence -
+  it is what killed the `_impure_ptr` corruption theory above.
+- **`BFAR` / `MMFAR` are only meaningful when `BFARVALID` / `MMARVALID` is set** in
+  CFSR. Read otherwise, they hold stale garbage (`0xe000edf8` was observed on a run
+  with `CFSR == 0`). Check the valid bit before believing the address.
+- **CFSR and HFSR bits are sticky** (write-1-to-clear) and accumulate across faults.
+  `monitor reset halt` before reading, or you may be decoding a previous run's fault.
+- **`call f()` from GDB that hits a `BKPT`** leaves a dummy frame on the target stack
+  ("GDB remains in the frame where the signal was received"). Do not unwind it by
+  hand - `monitor reset halt` and start clean.
+- **Faulting-PC lookup without a board:** `arm-none-eabi-objdump -d --start-address=
+  <pc-0x20> --stop-address=<pc+0x20> build/firmware.elf`, or `nm -n` and find the last
+  symbol below the PC. The hardware-stacked frame is `R0, R1, R2, R3, R12, LR, PC,
+  xPSR`, so `x/8wx $sp` in a handler that pushes nothing puts the **7th word** at the
+  faulting instruction.
 
 ### In progress
 
-**Phase 1, steps 2-3.** Step 1 is done and verified above.
+**Phase 1, step 3.** Steps 1 and 2 are done and verified above.
 
-- **`delay_ticks`** - takes ticks (option B). Two correctness points: the wait
-  comparison must **subtract** (`now - start`), never build a deadline by adding -
-  `tick_count` wraps at 2^32 (~49.7 days) and an added deadline lands on the wrong side
-  of the wrap, returning instantly. And waiting for N tick boundaries only guarantees
-  *more than N-1* periods, because the call arrives mid-period; **wait N+1** to
-  guarantee "at least N". Keep that `+1` **out** of `MS_TO_TICKS` - it is about *when
-  you called*, not about units. Do not claim the name `os_delay`; Phase 4 needs it for
-  the blocking version, and the difference must stay visible.
-- **GPIO driver** - `gpio.c` is still an empty file. `BSRR`, not `ODR`.
-- `main.c` still spins on `200000` and still toggles via `ODR ^=`.
+- **GPIO driver** - `gpio.c` is still an empty file. The `set_pin(port, pin, state)`
+  layer. `BSRR`, not `ODR`: set and clear are single writes with no read-modify-write
+  window, which stops mattering as style and starts mattering as *correctness* in
+  Phase 4 when a preemption can land mid-RMW. `main.c` still toggles via `ODR ^=` and
+  still configures PA5's `MODER` inline - both move behind the driver.
+
+Open, not blocking:
+
+- **`uart.c` baud.** `BRR` now derives from `PCLK1_HZ` (that half is done), but
+  `115200` is still a bare literal inside the division, and the division **truncates**
+  instead of rounding. Wanted: a named constant in `uart.c` (nothing outside programs
+  `BRR`, so it is not header material), `(num + den/2) / den` rounding, and three
+  asserts beside it - `BRR` fits 16 bits, `BRR >= 16` (required at `OVER8 = 0`; confirm
+  the wording in RM0365's USART chapter), and **achieved baud within ~2% of requested**.
+  That last one is the valuable one: it turns "enabling the PLL broke the UART" into a
+  build error naming the file. State the error bound without ever subtracting unsigned
+  values - compare scaled products; `115200 * 102` is nowhere near overflowing 32 bits.
+  At 8 MHz the value stays 69 either way, which is exactly why to do it *before* the
+  PLL lands and the fraction crosses .5.
+- **`get_tick_count` breaks the module-prefix pattern** used everywhere else
+  (`uart2_init`, `uart2_putc`, `systick_init`, `is_systick_initialized`).
+  `systick_get_count` would be consistent. Cheap now with two callers; annoying once
+  the scheduler reads it from four places.
+- **`main.c` has two stale `todo:` comments** - one on `setvbuf`, one on `_write`.
+  Both are answered in the Phase 0 traps section above.
 
 Carried forward, still true:
 
 - `SystemCoreClock` is *declared* by `system_stm32f3xx.h` but never *defined* -
   `system_stm32f3xx.c` was deliberately not kept. Using it compiles clean and fails at
   link. The fix is `clock.h`, **not** adding ST's file back.
-- `115200` is still a bare literal in `uart.c`; the `BRR` derivation is still a TODO.
 
 ### Not started
 
@@ -491,7 +640,7 @@ Phases 2–8.
 
 ---
 
-## Project layout (actual, as of Phase 1 step 1)
+## Project layout (actual, as of Phase 1 step 2)
 
 ```
 preemptive_rtos_kernel/
@@ -500,10 +649,13 @@ preemptive_rtos_kernel/
 │   └── Device/ST/STM32F3xx/Include/ (stm32f302x8.h, stm32f3xx.h)
 ├── src/
 │   ├── clock.h     (SYSCLK/HPRE/PPRE1 inputs; HCLK_HZ + PCLK1_HZ derived; asserts)
+│   ├── delay.c     (delay_ticks - spin on the tick counter, __BKPT if SysTick is off)
+│   ├── delay.h     (delay_ticks decl only)
 │   ├── gpio.c      (EMPTY - Phase 1 step 3)
 │   ├── main.c      (.data/.bss acceptance checks, blinky, printf loop)
 │   ├── startup.s
-│   ├── systick.c   (reload value + its 3 asserts, init, handler, get_tick_count)
+│   ├── systick.c   (reload value + its 3 asserts, init, handler, get_tick_count,
+│   │                is_systick_initialized; tick_count is static here)
 │   ├── systick.h   (TICK_RATE_HZ, MS_PER_SECOND, MS_TO_TICKS, TICKS_TO_MS, decls)
 │   ├── uart.c      (uart2_init, uart2_putc, _write)
 │   └── uart.h
@@ -620,8 +772,13 @@ Phase 3 is when that becomes likely.
    table *points at it*, read slot 15 (exception number 15 -> byte offset `0x3C`) with
    `x/a 0x0800003c`. Expect an **odd** address - bit 0 is the T-bit, and an even
    vector entry takes a UsageFault/`INVSTATE` that escalates to HardFault.
-2. **`delay_ticks()`** spinning on the tick counter. Deletes the magic `200000`.
-   Named for its unit, not `delay_ms` - under option B it takes ticks.
+~~2. **`delay_ticks()`** spinning on the tick counter. Deletes the magic `200000`.
+   Named for its unit, not `delay_ms` - under option B it takes ticks.~~ **Done -
+   verified on hardware.** Kept its unit suffix deliberately: the name is the only
+   place the unit is recorded, and Phase 4 adds a *blocking* `os_delay` that must stay
+   visibly different at every call site. Once the scheduler exists, a spin-delay in
+   task code is a bug but stays legal in boot code and ISRs - so the distinct name is
+   what makes the audit greppable.
 3. **A GPIO driver** — the `set_pin(port, pin, state)` layer. Use `BSRR`, not `ODR`:
    `BSRR` does set and clear as single writes with no read-modify-write window, which
    stops mattering as style and starts mattering as correctness in Phase 4 when a
@@ -637,7 +794,7 @@ Do not derive the SysTick reload value from `SystemCoreClock` — see the note i
 | Phase | Content | Est. | Status |
 |---|---|---|---|
 | **0** | Toolchain, own startup/linker/Makefile, blinky on PA5, GDB, `printf` | weekend | ✅ **done** |
-| **1** | SysTick at 1 kHz + tick counter, GPIO driver, `delay_ticks()` spinning on ticks | weekend | step 1 ✅ — steps 2–3 ← **here** |
+| **1** | SysTick at 1 kHz + tick counter, GPIO driver, `delay_ticks()` spinning on ticks | weekend | steps 1–2 ✅ — step 3 ← **here** |
 | **2** | **The context switch.** Two hardcoded tasks alternating on SysTick. No scheduler, no priorities. Prove a task can be left mid-execution and resumed exactly | the hard part |
 | **3** | Task Control Blocks, stack initialization, a real round-robin scheduler, `os_start()` | 1 wk |
 | **4** | Task states (READY/RUNNING/BLOCKED/SUSPENDED), `os_delay()` that yields instead of spinning, fixed-priority preemption, `os_yield()` | 1–2 wk |

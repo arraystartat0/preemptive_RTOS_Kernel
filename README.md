@@ -37,11 +37,18 @@ preemptive_rtos_kernel/
 ├── cmsis/
 │   ├── Include/                     core_cm4.h, cmsis_gcc.h, ...
 │   └── Device/ST/STM32F3xx/Include/ stm32f302x8.h, stm32f3xx.h, system_stm32f3xx.h
-├── src/                             main.c, startup.s  (not written yet)
+├── src/
+│   ├── clock.h                      SYSCLK/HPRE/PPRE1 inputs; HCLK/PCLK1 derived
+│   ├── delay.c/.h                   delay_ticks() — spins on the tick counter
+│   ├── gpio.c                       empty — Phase 1 step 3
+│   ├── main.c                       .data/.bss acceptance checks, blinky, printf loop
+│   ├── startup.s                    vector table, .data copy, .bss zero
+│   ├── systick.c/.h                 1 kHz tick, tick counter, ms<->tick conversions
+│   └── uart.c/.h                    USART2 init, putc, _write() retarget
 ├── build/                           gitignored
 ├── linker.ld
 ├── openocd.cfg
-├── Makefile                         (not written yet)
+├── Makefile
 ├── CLAUDE.md                        working notes, phase plan, detailed status
 └── README.md
 ```
@@ -95,8 +102,13 @@ weeks later.
 S16–S31, the FP bit in `EXC_RETURN`) is a second hard problem stacked on the first. It
 gets added deliberately, after Phase 7.
 
-`-nostdlib` — holds until `printf` is wanted, at which point it becomes
-`--specs=nano.specs --specs=nosys.specs` plus a hand-written `_write()`.
+`--specs=nano.specs --specs=nosys.specs` plus a hand-written `_write()` — this replaced
+`-nostdlib` once `printf` was wanted. `printf` costs about 4.6 KB of text. Call
+`setvbuf(stdout, NULL, _IONBF, 0)` once before any output: newlib otherwise allocates a
+stdio buffer through `malloc`, and libnosys's `_sbrk` always fails.
+
+Header dependency tracking is on (`-MMD -MP`), so editing a header rebuilds exactly what
+included it.
 
 ---
 
@@ -104,7 +116,7 @@ gets added deliberately, after Phase 7.
 
 ```
 make                 # -> build/firmware.elf, build/firmware.bin, size report
-make flash           # program and reset via OpenOCD
+make flash           # program, verify, and reset via OpenOCD
 make clean
 ```
 
@@ -116,48 +128,97 @@ arm-none-eabi-gdb build/firmware.elf       # then: target extended-remote localh
 ```
 
 `openocd.cfg` selects the ST-LINK interface, SWD transport, and the `stm32f3x` target,
-then clocks SWCLK at 1 MHz — comfortably under the F_cpu/6 ceiling at 8 MHz HSI.
+then asks for 1 MHz on SWCLK — comfortably under the F_cpu/6 ceiling at 8 MHz HSI. The
+ST-LINK only offers fixed divisors, so it clamps to 950 kHz and says so twice on every
+connection. Cosmetic.
+
+Note that OpenOCD only auto-loads `./openocd.cfg` when invoked with **neither** `-f` nor
+`-c`. The `make flash` recipe passes `-c "program ..."`, so it must also pass
+`-f openocd.cfg` explicitly or it has no adapter driver.
+
+**First command of every debug session:**
+
+```
+compare-sections
+```
+
+If it does not report every section matched, the board is running a different binary
+than the ELF you are reasoning about, and any fault decode you do will be internally
+consistent and completely fictional. GDB's "source file is more recent than executable"
+warning is the same signal, earlier.
 
 ---
 
 ## Status
 
-**Phase 0, in progress.**
+**Phase 0 complete. Phase 1 steps 1–2 complete. Phase 1 step 3 in progress.**
 
-Working:
+Current image: **5824 text / 96 data / 1368 bss**. LD2 blinks at 250 ms off a real
+1 kHz tick while an incrementing counter streams out the VCP.
 
-- Board alive, SWD link confirmed — `STLINK V2J36M26 (API v2)`, target voltage 3.26 V,
-  `SWD DPIDR 0x2ba01477`, `Cortex-M4 r0p1 processor detected`, GDB server up on 3333.
-- Full toolchain installed and verified.
-- CMSIS headers vendored and verified by compiling a throwaway translation unit against
-  the real CFLAGS — resolved `stm32f3xx.h`, dispatched on `-DSTM32F302x8`, accepted
-  `RCC->AHBENR |= RCC_AHBENR_GPIOAEN` and `GPIOA->MODER`, resolved `USB_LP_IRQn`,
-  confirmed `__FPU_USED == 0`.
-- `openocd.cfg` written.
-- `linker.ld` written — memory regions, `.isr_vector` first in FLASH, `.data` with
-  `>RAM AT> FLASH`, `.bss` bracketed by `_sbss`/`_ebss`, `_estack` at the top of RAM.
+Phase 0 — build, step, print (verified on hardware):
 
-Next: `src/startup.s`, `src/main.c`, the `Makefile`, then blinky on PA5 and a GDB
-single-step through `main`. Phase 0 is not done until build, step, and `printf` over the
-VCP are all frictionless.
+- Own `startup.s` — 98-word / 392-byte vector table with a self-checking assembly-time
+  length assertion, `.data` copy and `.bss` zero loops that both guard the zero-length
+  case, and a `HardFault_Handler` with its own body so faults break distinctly.
+- Own `linker.ld` — `.isr_vector` first in FLASH, `.data` with `>RAM AT> FLASH`, `.bss`
+  bracketed by `_sbss`/`_ebss`, `_estack` at the top of RAM.
+- Acceptance test: `golden_data = 0xDEADBEEF` in `.data` and `golden_bss` in `.bss` both
+  read correctly at a breakpoint on `main`, exercising both startup loops. The `.data`
+  chain was also verified statically — `readelf -l` gave the segment LMA, and `xxd` found
+  `0xDEADBEEF` physically present in the binary at that offset.
+- `printf` retargeted to USART2 through a hand-written `_write()`.
 
-See [CLAUDE.md](CLAUDE.md) for detailed working notes.
+Phase 1 step 1 — SysTick at 1 kHz:
+
+- Vector proven to point at the handler (`x/a 0x0800003c`), not merely to exist.
+- `LOAD = 0x1f3f`, `CTRL = 0x7`, priority byte `0xf0` (lowest — a tick handler must
+  never delay a device interrupt).
+- Clock tree is *derived*, not hand-maintained: three independent inputs in `clock.h`
+  (`SYSCLK_HZ`, `HPRE_DIV`, `PPRE1_DIV`), everything else by division, with exactness
+  asserted at every division node. Enabling the PLL later is a two-number edit.
+
+Phase 1 step 2 — `delay_ticks()`:
+
+- Spins on elapsed ticks via **subtraction** (`now - start`), never a computed deadline.
+  Verified across a real rollover: `tick_count` forced to `0xFFFFFFF0` immediately before
+  a 251-boundary wait read back **235** — it passed through zero mid-delay and still
+  waited its full length.
+- Waits **N+1** boundaries, because a call arriving mid-period only guarantees more than
+  N−1 full periods otherwise.
+- Traps on `__BKPT(0)` if SysTick is not running, rather than returning early — a silent
+  early return would convert a visible hang into a wrong-timing bug. Verified by forcing
+  `SysTick->CTRL = 0` and calling into it from GDB.
+
+Next: the GPIO driver — a `set_pin(port, pin, state)` layer built on `BSRR` rather than
+`ODR`, so set and clear are single writes with no read-modify-write window. That stops
+being a style question and becomes correctness in Phase 4, when a preemption can land
+mid-RMW.
+
+See [CLAUDE.md](CLAUDE.md) for detailed working notes, including the traps hit along the
+way and how each was found.
 
 ---
 
 ## Roadmap
 
-| Phase | Content | Est. |
-|---|---|---|
-| 0 | Toolchain, own startup/linker/Makefile, blinky on PA5, GDB, `printf` | weekend |
-| 1 | SysTick at 1 kHz + tick counter, GPIO driver, `delay_ms()` spinning on ticks | weekend |
-| 2 | **The context switch.** Two hardcoded tasks alternating on SysTick. No scheduler, no priorities. Prove a task can be left mid-execution and resumed exactly | the hard part |
-| 3 | Task Control Blocks, stack initialization, round-robin scheduler, `os_start()` | 1 wk |
-| 4 | Task states (READY/RUNNING/BLOCKED/SUSPENDED), yielding `os_delay()`, fixed-priority preemption, `os_yield()` | 1–2 wk |
-| 5 | Nestable critical sections, counting semaphore, mutex with priority inheritance — reproduce the inversion bug on a scope first, then fix it | 1–2 wk |
-| 6 | Fixed-size message queues, blocking send/receive with timeouts, ISR-safe variants using a deferred-yield flag | 1 wk |
-| 7 | Stack overflow detection (paint `0xDEADBEEF`, watermark checks at switch), fault handlers that decode CFSR/HFSR, static allocation only, `assert` | — |
-| 8 | **Prove it.** Logic-analyzer capture of task entry/exit, context switch latency in cycles via `DWT->CYCCNT`, worst-case interrupt latency published below, demo app | — |
+| Phase | Content | Est. | Status |
+|---|---|---|---|
+| 0 | Toolchain, own startup/linker/Makefile, blinky on PA5, GDB, `printf` | weekend | ✅ done |
+| 1 | SysTick at 1 kHz + tick counter, `delay_ticks()` spinning on ticks, GPIO driver | weekend | steps 1–2 ✅, step 3 ← **here** |
+| 2 | **The context switch.** Two hardcoded tasks alternating on SysTick. No scheduler, no priorities. Prove a task can be left mid-execution and resumed exactly | the hard part | |
+| 3 | Task Control Blocks, stack initialization, round-robin scheduler, `os_start()` | 1 wk | |
+| 4 | Task states (READY/RUNNING/BLOCKED/SUSPENDED), yielding `os_delay()`, fixed-priority preemption, `os_yield()` | 1–2 wk | |
+| 5 | Nestable critical sections, counting semaphore, mutex with priority inheritance — reproduce the inversion bug on a scope first, then fix it | 1–2 wk | |
+| 6 | Fixed-size message queues, blocking send/receive with timeouts, ISR-safe variants using a deferred-yield flag | 1 wk | |
+| 7 | Stack overflow detection (paint `0xDEADBEEF`, watermark checks at switch), fault handlers that decode CFSR/HFSR, static allocation only, `assert` | — | |
+| 8 | **Prove it.** Logic-analyzer capture of task entry/exit, context switch latency in cycles via `DWT->CYCCNT`, worst-case interrupt latency published below, demo app | — | |
+
+Public APIs take **ticks**, not milliseconds — `delay_ticks(MS_TO_TICKS(250))`, the same
+shape as FreeRTOS's `pdMS_TO_TICKS`. The verbosity is the point: it keeps the
+quantisation visible instead of letting callers assume 1 tick = 1 ms. `MS_TO_TICKS`
+rounds **up** (a delay promises *at least* that long); `TICKS_TO_MS` truncates (a
+measurement must not overstate).
 
 Realistic timeline: 8–12 weeks part-time, with most of the pain concentrated in Phase 2.
 
@@ -175,6 +236,12 @@ currently unfilled by design.
 | Tick handler cost | — | `DWT->CYCCNT` |
 | Per-task RAM overhead | — | `.map` file + TCB sizeof |
 
+Two rules for when these get filled in. The day-to-day build is `-O0`, and a context
+switch latency measured at `-O0` is not a number worth publishing — measure at `-O2` and
+say which. And use `DWT->CYCCNT`, which counts the core clock directly, rather than an
+APB timer: timers on APB1 run at PCLK1 × 2 whenever `PPRE1 != 1`, which is an easy 2×
+error waiting to happen.
+
 ---
 
 ## F3-specific notes
@@ -184,16 +251,46 @@ currently unfilled by design.
   common wasted hour on this chip.
 - **`stm32f303x8.h` is not a substitute for `stm32f302x8.h`.** It looks fine at first —
   `SysTick_IRQn` and `PendSV_IRQn` are core exceptions and identical, and `USART2_IRQn`
-  happens to share a slot — but F302x8 has 59 IRQ entries to F303x8's 52, slot 18 is
-  `ADC1_IRQn` not `ADC1_2_IRQn`, and 19/20 are the USB-shared CAN vectors. It detonates
-  in Phase 4 when NVIC priorities start mattering.
+  happens to share a slot — but the device IRQ lists diverge. It detonates in Phase 4,
+  when NVIC priorities start mattering.
+- **RM0365 documents two different vector tables.** Table 40 is STM32F302x**B/C/D/E**;
+  Table 41 is STM32F302x**6/8**, the Nucleo's part. Transcribing Table 40 gives you
+  peripherals this silicon does not have. Verified figures for F302x8: 16 core
+  exceptions + **82 device IRQ slots** (50 named, 32 reserved), last vector at position
+  81, **98 words / 392 bytes** total. Invariant to check work against: *enum value ==
+  table index − 16*.
+- **ST omitted the row for position 66 from Table 41** — the printed table jumps 65 → 67.
+  It is reserved. Copying row-by-row yields a 97-word table with everything after 65
+  shifted by one: silent, and only visible once NVIC priorities matter.
+- **RM acronyms are not CMSIS symbol names.** Positions are identical, labels are not
+  (`TAMPER_STAMP` vs `TAMP_STAMP_IRQn`, `CAN_TX` vs `USB_HP_CAN_TX_IRQn`, …). Use the
+  CMSIS names so `NVIC_EnableIRQ(USART2_IRQn)` pairs with `USART2_IRQHandler`.
+- **The F3 USART is the modern one.** Status is `ISR`, not `SR`, and transmit/receive are
+  separate `TDR`/`RDR`, not one `DR`. `BRR` holds USARTDIV **directly** at `OVER8 = 0` —
+  no mantissa/fraction split, so F1/F4 code that shifts by 4 is wrong here. Also note
+  three different buses in one file: GPIO on `AHBENR`, USART2 on `APB1ENR`, USART1 on
+  `APB2ENR`.
+- **Instance pointers carry the number; bit-mask macros do not.** `USART2->ISR` but
+  `USART_ISR_TXE`. And `_0`/`_1` suffixes name which bit *of the field*, not the value —
+  `MODER5_0` writes `01` (output), `MODER5_1` writes `10` (alternate function).
+- **SysTick is ARM's, not ST's.** It lives in the System Control Space at `0xE000E010`,
+  is documented in **PM0214** rather than RM0365, comes from `core_cm4.h` rather than the
+  device header, and has no RCC enable bit. Period is `LOAD + 1` cycles. It also stops
+  counting while the core is halted in debug — so a frozen `VAL` at a breakpoint is
+  expected, and tick-based intervals measured across a halt undercount.
+- **64 MHz is the PLL ceiling from HSI on this part.** `PLLSRC` is a one-bit field
+  (HSI/2 or HSE/PREDIV) and `PLLMUL` maxes at ×16, so 72 MHz requires HSE — and the
+  NUCLEO-64's X3 crystal footprint ships unpopulated. `HPRE` also skips 32 (…16, **64**,
+  128…), so a power-of-two assert would wave an illegal divisor through.
 
 ---
 
 ## References
 
-- **RM0365** — STM32F302 reference manual. RCC, GPIO, USART chapters. Search it, don't read it.
+- **RM0365** — STM32F302 reference manual. RCC, GPIO, USART chapters. Search it, don't read it. Table 41 is this part's vector table, **not** Table 40.
+- **PM0214** — STM32 Cortex-M4 programming manual. SysTick, NVIC, SCB — the things RM0365 does not document because they are ARM's, not ST's.
 - **UM1724** — Nucleo-64 board user manual.
+- **STM32F302R8 datasheet** — the alternate-function tables. Which AF wires which pin to which peripheral is a package fact, not in the RM. PA2 → AF7 for USART2_TX.
 - **DDI 0403** — ARMv7-M Architecture Reference Manual. The authority. Search only.
 - Joseph Yiu, *The Definitive Guide to ARM Cortex-M3 and Cortex-M4 Processors* — the exception model chapters.
 - Miro Samek, *Modern Embedded Systems Programming* (YouTube), lessons ~22–27.
