@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include "uart.h"
 #include "systick.h"
+#include "delay.h"
 
 // golden variables to populate the .data and .bss sections
 volatile uint32_t golden_data = 0xDEADBEEF; // This variable is initialized and should be in .data
@@ -79,28 +80,6 @@ int main(void){
         printf("%d\r\n", counter);
         GPIOA->ODR ^= GPIO_ODR_5; // Toggle PA5 (LED)
         // Add a simple delay to make the LED toggle visible
-        for (volatile int i = 0; i < 200000; i++); // delay
-        /* 
-            -O0 is the optimization level, so for a volatile
-            i in assembly the compiler loads from RAM to
-            a register, increments the register, and then stores /
-            it back to RAM and the load is done again. over an over.
-            registers are fast but ram transactions are slow, so 
-            roughly: a register-to-register operation costs 1 cycle. 
-            A load or store costs 2 or more. Therefore in this case
-            The variable is loaded twice: 
-            - once to increment, once to test because volatile means 
-            "this could have changed behind your back, re-read it." 
-            - And the taken branch costs about 3 rather than 1: 
-            the M4 has a three-stage pipeline, and jumping backwards 
-            throws away the instructions already fetched, so the pipeline
-            has to refill.
-            So one iteration ≈ 10 cycles
-
-            HSI at 8MHz -> 8,000,000 cycles per second
-            Target a blink at 250ms -> 2,000,0000 cycles (8x10^6 * 0.25)
-            1 iteration = 10 cycles
-            -> 2,000,000 / 10 = 200,000
-        */
+        delay_ticks(MS_TO_TICKS(250)); // Delay for 250 milliseconds
     }
 }

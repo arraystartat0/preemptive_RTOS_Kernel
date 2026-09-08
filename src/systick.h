@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <stdbool.h>
 // This file contains the declarations for the SysTick timer functions and variables.
 // SysTick is a system timer that can be used for generating periodic interrupts, measuring time intervals, and implementing delays.
 // The tick rate of this kernel is 1000Hz, which means that the SysTick timer will generate an interrupt every 1 millisecond.
@@ -28,3 +29,4 @@
 
 void systick_init(void);
 uint32_t get_tick_count(void);
+bool is_systick_initialized(void);

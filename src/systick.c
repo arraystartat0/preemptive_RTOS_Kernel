@@ -9,7 +9,7 @@ _Static_assert(SYSTICK_RELOAD_VALUE <= 0xFFFFFF, "SysTick reload value exceeds 2
 _Static_assert(SYSTICK_RELOAD_VALUE != 0, "SysTick reload value must be greater than zero");
 _Static_assert(HCLK_HZ % TICK_RATE_HZ == 0, "HCLK_HZ must be divisible by TICK_RATE_HZ for proper SysTick operation");
 
-static volatile uint32_t tick_count = 0; // Global tick count variable
+static volatile uint32_t tick_count = 0;
 
 void systick_init(void) {
     // Set the reload value for the SysTick timer
@@ -28,4 +28,8 @@ void SysTick_Handler(void) {
 
 uint32_t get_tick_count(void) {
     return tick_count;
+}
+
+bool is_systick_initialized(void) {
+    return ((SysTick->CTRL & (SysTick_CTRL_ENABLE_Msk | SysTick_CTRL_TICKINT_Msk)) == (SysTick_CTRL_ENABLE_Msk | SysTick_CTRL_TICKINT_Msk)); // Check if SysTick timer is enabled
 }
