@@ -26,7 +26,7 @@ void SysTick_Handler(void) {
     tick_count++; // Increment the global tick count on each SysTick interrupt
 }
 
-uint32_t get_tick_count(void) {
+uint32_t systick_get_tick_count(void) {
     return tick_count;
 }
 

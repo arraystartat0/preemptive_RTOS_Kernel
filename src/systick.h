@@ -28,5 +28,5 @@
 #define TICKS_TO_MS(ticks) (((ticks) * MS_PER_SECOND) / TICK_RATE_HZ) // Convert ticks to milliseconds
 
 void systick_init(void);
-uint32_t get_tick_count(void);
+uint32_t systick_get_tick_count(void);
 bool is_systick_initialized(void);
