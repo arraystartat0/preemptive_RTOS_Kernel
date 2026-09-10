@@ -40,7 +40,7 @@ preemptive_rtos_kernel/
 ├── src/
 │   ├── clock.h                      SYSCLK/HPRE/PPRE1 inputs; HCLK/PCLK1 derived
 │   ├── delay.c/.h                   delay_ticks() — spins on the tick counter
-│   ├── gpio.c                       empty — Phase 1 step 3
+│   ├── gpio.c/.h                    gpio_init_output(), gpio_write_pin() via BSRR/BRR
 │   ├── main.c                       .data/.bss acceptance checks, blinky, printf loop
 │   ├── startup.s                    vector table, .data copy, .bss zero
 │   ├── systick.c/.h                 1 kHz tick, tick counter, ms<->tick conversions
@@ -151,10 +151,10 @@ warning is the same signal, earlier.
 
 ## Status
 
-**Phase 0 complete. Phase 1 steps 1–2 complete. Phase 1 step 3 in progress.**
+**Phase 0 complete. Phase 1 complete. Phase 2 (the context switch) starting.**
 
-Current image: **5824 text / 96 data / 1368 bss**. LD2 blinks at 250 ms off a real
-1 kHz tick while an incrementing counter streams out the VCP.
+Current image: **6200 text / 96 data / 1368 bss**. LD2 blinks at 250 ms off a real
+1 kHz tick, through the GPIO driver, while an incrementing counter streams out the VCP.
 
 Phase 0 — build, step, print (verified on hardware):
 
@@ -190,10 +190,24 @@ Phase 1 step 2 — `delay_ticks()`:
   early return would convert a visible hang into a wrong-timing bug. Verified by forcing
   `SysTick->CTRL = 0` and calling into it from GDB.
 
-Next: the GPIO driver — a `set_pin(port, pin, state)` layer built on `BSRR` rather than
-`ODR`, so set and clear are single writes with no read-modify-write window. That stops
-being a style question and becomes correctness in Phase 4, when a preemption can land
-mid-RMW.
+Phase 1 step 3 — GPIO driver:
+
+- `gpio_init_output(port, pin)` and `gpio_write_pin(port, pin, state)`. `pin` is an
+  index 0–15, not a mask; `state` is an enum, not a bare int.
+- Writes are **single stores** — `BSRR` to set, `BRR` to clear — with no
+  read-modify-write window. That is a style choice today and a correctness requirement
+  in Phase 4, when a preemption can land mid-RMW. Init is still RMW on `MODER` and
+  friends; fine at boot, and the Phase 5 critical section is what makes it safe later.
+- Port → `AHBENR` bit mapping is a static lookup over the ports this package has; an
+  unknown port or out-of-range pin traps on `__BKPT(0)` rather than returning. `main.c`
+  no longer touches `MODER` or `ODR` directly.
+
+Next: **Phase 2, the context switch.** Two hardcoded tasks with their own stacks,
+alternating on SysTick via PendSV. The proof is that a task interrupted mid-loop resumes
+with every register and local exactly as it left them. The hardware stacks eight
+registers on exception entry; the handler's job is the other eight (`R4–R11`) and the
+swap between MSP and PSP. Plan and expected fault sequence are in
+[CLAUDE.md](CLAUDE.md).
 
 See [CLAUDE.md](CLAUDE.md) for detailed working notes, including the traps hit along the
 way and how each was found.
@@ -205,8 +219,8 @@ way and how each was found.
 | Phase | Content | Est. | Status |
 |---|---|---|---|
 | 0 | Toolchain, own startup/linker/Makefile, blinky on PA5, GDB, `printf` | weekend | ✅ done |
-| 1 | SysTick at 1 kHz + tick counter, `delay_ticks()` spinning on ticks, GPIO driver | weekend | steps 1–2 ✅, step 3 ← **here** |
-| 2 | **The context switch.** Two hardcoded tasks alternating on SysTick. No scheduler, no priorities. Prove a task can be left mid-execution and resumed exactly | the hard part | |
+| 1 | SysTick at 1 kHz + tick counter, `delay_ticks()` spinning on ticks, GPIO driver | weekend | ✅ done |
+| 2 | **The context switch.** Two hardcoded tasks alternating on SysTick. No scheduler, no priorities. Prove a task can be left mid-execution and resumed exactly | the hard part | ← **here** |
 | 3 | Task Control Blocks, stack initialization, round-robin scheduler, `os_start()` | 1 wk | |
 | 4 | Task states (READY/RUNNING/BLOCKED/SUSPENDED), yielding `os_delay()`, fixed-priority preemption, `os_yield()` | 1–2 wk | |
 | 5 | Nestable critical sections, counting semaphore, mutex with priority inheritance — reproduce the inversion bug on a scope first, then fix it | 1–2 wk | |

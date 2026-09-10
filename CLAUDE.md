@@ -346,7 +346,7 @@ from `main.c`; the blink is now `delay_ticks(MS_TO_TICKS(250))`.
 Shape that survived review:
 
 - Lives in **`delay.c`, not `systick.c`**. SysTick is the timer *driver*; a spin-delay
-  is a *consumer* of the tick counter. `delay.c` knows only `get_tick_count()` and
+  is a *consumer* of the tick counter. `delay.c` knows only `systick_get_tick_count()` and
   `is_systick_initialized()` - never the reload value.
 - **`delay_ticks` does not call `systick_init`.** An early version did, "in case it
   wasn't initialised yet". It re-ran init on *every* call, and `SysTick->VAL = 0`
@@ -404,7 +404,7 @@ the correct `_impure_ptr` value physically present in flash. Same family as the 
 
 **Only one of the two is detectable**, from the same root cause: a header must
 *declare*, never *define*. The correct shape was already in the file - object `static`
-in the `.c`, accessor in the `.h`, exactly like `tick_count` / `get_tick_count`.
+in the `.c`, accessor in the `.h`, exactly like `tick_count` / `systick_get_tick_count`.
 
 **`_Static_assert` is compile-time and cannot see runtime state.**
 
@@ -598,35 +598,59 @@ Rules that came out of it:
   xPSR`, so `x/8wx $sp` in a handler that pushes nothing puts the **7th word** at the
   faulting instruction.
 
-### In progress
+### Phase 1 step 3 - COMPLETE (verified on hardware, 2026-09-10) -> **Phase 1 is done**
 
-**Phase 1, step 3.** Steps 1 and 2 are done and verified above.
+GPIO driver in `gpio.c` / `gpio.h`. `main.c` no longer touches `MODER` or `ODR` at all
+(grep is clean) - PA5 goes through `gpio_init_output(GPIOA, 5)` and
+`gpio_write_pin(GPIOA, 5, GPIO_HIGH | GPIO_LOW)`. LD2 blinks through the driver.
+`firmware.elf` is **6200 text / 96 data / 1368 bss**.
 
-- **GPIO driver** - `gpio.c` is still an empty file. The `set_pin(port, pin, state)`
-  layer. `BSRR`, not `ODR`: set and clear are single writes with no read-modify-write
-  window, which stops mattering as style and starts mattering as *correctness* in
-  Phase 4 when a preemption can land mid-RMW. `main.c` still toggles via `ODR ^=` and
-  still configures PA5's `MODER` inline - both move behind the driver.
+Shape that shipped:
 
-Open, not blocking:
+- Two public functions, `gpio_init_output(port, pin)` and
+  `gpio_write_pin(port, pin, state)`. **`pin` is an index 0-15, not a mask** - the
+  header says so twice, because it is the obvious call-site mistake. `state` is a
+  `GPIO_state` enum (`GPIO_HIGH` / `GPIO_LOW`), not a bare int.
+- **Writes are single stores: `BSRR` to set, `BRR` to clear.** No read-modify-write
+  window. The F3 GPIO has a dedicated 16-bit `BRR`; F4 does not (it clears via
+  `BSRR[31:16]`). Either works here - the property that matters is that *neither reads
+  the register first*. This is what Phase 4 leans on.
+- **Init is still RMW** on `MODER` / `OSPEEDR` / `PUPDR` / `OTYPER` (clear the field,
+  then set it). Fine at boot, **not** preemption-safe: two tasks initialising pins on
+  the same port concurrently is a real race. Known, unguarded, written down - Phase 5's
+  critical section is the fix, not a rewrite.
+- Port -> `AHBENR` bit mapping is a `static` lookup (`gpio_clock_mask`) over the ports
+  this package actually has (A, B, C, D, F - no E on the F302x8). Unknown port and
+  out-of-range pin both hit `__BKPT(0)` + spin, same trap-don't-return policy as
+  `delay_ticks`. The pin check runs in *both* public functions.
+- `__DSB()` after the clock enable, before the first register write to the port.
+  Cheap insurance against the enable not having landed by the next store.
+- `gpio_init_output(GPIOA, 5)` runs **before** `uart2_init()`; there is an ordering
+  comment in `main.c`. `uart2_init` still does its own PA2 setup - that has not moved
+  behind the driver, deliberately: the driver has no "alternate function" mode yet and
+  Phase 2 does not need one.
 
-- **`uart.c` baud.** `BRR` now derives from `PCLK1_HZ` (that half is done), but
-  `115200` is still a bare literal inside the division, and the division **truncates**
-  instead of rounding. Wanted: a named constant in `uart.c` (nothing outside programs
-  `BRR`, so it is not header material), `(num + den/2) / den` rounding, and three
-  asserts beside it - `BRR` fits 16 bits, `BRR >= 16` (required at `OVER8 = 0`; confirm
-  the wording in RM0365's USART chapter), and **achieved baud within ~2% of requested**.
-  That last one is the valuable one: it turns "enabling the PLL broke the UART" into a
-  build error naming the file. State the error bound without ever subtracting unsigned
-  values - compare scaled products; `115200 * 102` is nowhere near overflowing 32 bits.
-  At 8 MHz the value stays 69 either way, which is exactly why to do it *before* the
-  PLL lands and the fraction crosses .5.
-- **`get_tick_count` breaks the module-prefix pattern** used everywhere else
-  (`uart2_init`, `uart2_putc`, `systick_init`, `is_systick_initialized`).
-  `systick_get_count` would be consistent. Cheap now with two callers; annoying once
-  the scheduler reads it from four places.
-- **`main.c` has two stale `todo:` comments** - one on `setvbuf`, one on `_write`.
-  Both are answered in the Phase 0 traps section above.
+Two `TODO`s left in `gpio.c` on purpose: one to re-derive the `MODER` clear/set
+arithmetic (answered under "CMSIS naming" in the Phase 0 traps - `_0`/`_1` name bits of
+the field, 2 bits per pin, position = pin x 2), and one to bump `OSPEEDR` for PA5
+before the Phase 8 logic-analyser capture.
+
+Open, not blocking (carried from step 2, status updated):
+
+- **`uart.c` baud.** ~~`115200` is a bare literal~~ - now `BAUD_RATE` in `uart.c`.
+  Still open: the division **truncates** instead of rounding (`(num + den/2) / den`),
+  and the three asserts beside it are not written - `BRR` fits 16 bits, `BRR >= 16`
+  (required at `OVER8 = 0`; confirm the wording in RM0365's USART chapter), and
+  **achieved baud within ~2% of requested**. That last one turns "enabling the PLL
+  broke the UART" into a build error naming the file. State the bound without
+  subtracting unsigned values - compare scaled products; `115200 * 102` is nowhere near
+  32-bit overflow. At 8 MHz the value stays 69 either way, which is exactly why to do
+  it *before* the PLL lands and the fraction crosses .5.
+- ~~**`get_tick_count` breaks the module-prefix pattern.**~~ Renamed to
+  `systick_get_tick_count`. Done.
+- **Stale `todo:` comments**, now five: `main.c` on `setvbuf`; `uart.c` on `_write` and
+  on the `BRR` derivation; the two in `gpio.c` above. All but the `OSPEEDR` one are
+  answered in this file. Delete them or don't - they are not blocking anything.
 
 Carried forward, still true:
 
@@ -634,13 +658,19 @@ Carried forward, still true:
   `system_stm32f3xx.c` was deliberately not kept. Using it compiles clean and fails at
   link. The fix is `clock.h`, **not** adding ST's file back.
 
+### In progress
+
+**Phase 2 - the context switch.** See "Phase 2, the plan" under "Immediate next
+steps" for the brief. Nothing written yet.
+
 ### Not started
 
-Phases 2–8.
+Phases 3-8. The PLL task is still slotted **between Phase 2 and Phase 3** (see the PLL
+section above for why not before).
 
 ---
 
-## Project layout (actual, as of Phase 1 step 2)
+## Project layout (actual, as of Phase 1 complete)
 
 ```
 preemptive_rtos_kernel/
@@ -651,10 +681,12 @@ preemptive_rtos_kernel/
 │   ├── clock.h     (SYSCLK/HPRE/PPRE1 inputs; HCLK_HZ + PCLK1_HZ derived; asserts)
 │   ├── delay.c     (delay_ticks - spin on the tick counter, __BKPT if SysTick is off)
 │   ├── delay.h     (delay_ticks decl only)
-│   ├── gpio.c      (EMPTY - Phase 1 step 3)
-│   ├── main.c      (.data/.bss acceptance checks, blinky, printf loop)
+│   ├── gpio.c      (gpio_init_output, gpio_write_pin via BSRR/BRR; static port->AHBENR
+│   │                lookup; __BKPT on bad port or pin)
+│   ├── gpio.h      (GPIO_state enum, the two decls; pin is an index, not a mask)
+│   ├── main.c      (.data/.bss acceptance checks, blinky through the driver, printf loop)
 │   ├── startup.s
-│   ├── systick.c   (reload value + its 3 asserts, init, handler, get_tick_count,
+│   ├── systick.c   (reload value + its 3 asserts, init, handler, systick_get_tick_count,
 │   │                is_systick_initialized; tick_count is static here)
 │   ├── systick.h   (TICK_RATE_HZ, MS_PER_SECOND, MS_TO_TICKS, TICKS_TO_MS, decls)
 │   ├── uart.c      (uart2_init, uart2_putc, _write)
@@ -779,13 +811,116 @@ Phase 3 is when that becomes likely.
    visibly different at every call site. Once the scheduler exists, a spin-delay in
    task code is a bug but stays legal in boot code and ISRs - so the distinct name is
    what makes the audit greppable.
-3. **A GPIO driver** — the `set_pin(port, pin, state)` layer. Use `BSRR`, not `ODR`:
+~~3. **A GPIO driver** — the `set_pin(port, pin, state)` layer. Use `BSRR`, not `ODR`:
    `BSRR` does set and clear as single writes with no read-modify-write window, which
    stops mattering as style and starts mattering as correctness in Phase 4 when a
-   preemption can land mid-RMW.
+   preemption can land mid-RMW.~~ **Done - verified on hardware.** Shipped as
+   `gpio_write_pin`, writing `BSRR` / `BRR`. See the Phase 1 step 3 section.
 
 Do not derive the SysTick reload value from `SystemCoreClock` — see the note in
-"In progress" above about why that link-errors, and why the fix is not ST's file.
+"Phase 1 step 3" above about why that link-errors, and why the fix is not ST's file.
+
+**Phase 1 complete (2026-09-10). → Phase 2.**
+
+### Phase 2, the plan
+
+**Goal, stated precisely:** two tasks, each an infinite loop with its own stack, each
+doing something *visibly distinct* (different LED pattern, or a private counter
+inspectable in GDB). SysTick decides to switch every N ticks; PendSV performs the
+switch. No TCB struct, no scheduler, no priorities, no blocking - a hardcoded pair and
+a "which one is running" pointer. **Pass criterion: a task interrupted mid-loop resumes
+with every register and its local variables exactly as it left them**, and the other
+task's state is untouched. Everything after Phase 2 is bookkeeping around this
+mechanism.
+
+**The mechanism has two halves, and the boundary between them is the whole trick.**
+
+1. *Hardware half.* On exception entry the core pushes 8 words - `xPSR, PC, LR, R12,
+   R3, R2, R1, R0` (that order, top of stack downward) - onto the stack that was active
+   in thread mode, then loads a magic value into `LR` (**EXC_RETURN**). On `bx lr` with
+   that magic value, it pops the same 8 words from whichever stack the EXC_RETURN bits
+   name and resumes at the popped `PC`. Everything the AAPCS calls caller-saved is
+   handled here for free.
+2. *Software half.* `R4-R11` are callee-saved: the hardware does **not** stack them,
+   because a normal handler is a function and functions preserve those. A context
+   switch is the one "function" that returns to a *different* caller, so the handler
+   itself must push `R4-R11` onto the outgoing task's stack, swap the stack pointer,
+   and pop `R4-R11` from the incoming task's stack, *then* `bx lr`. 8 + 8 = **16 words =
+   64 bytes per task frame** with the FPU off (`-mfloat-abi=soft`; this is why).
+
+**Six things the hardware requires, each a Phase 2 sub-step:**
+
+- **Two stack pointers.** Handlers run on `MSP`; tasks run on `PSP`. Selected by
+  `CONTROL.SPSEL` (bit 1), and by the EXC_RETURN value on exception return:
+  `0xFFFFFFF9` = return to thread mode on MSP, `0xFFFFFFFD` = return to thread mode on
+  PSP. The switcher reads/writes `PSP` explicitly (`MRS`/`MSR` with the special
+  register name) - `SP` inside the handler *is* `MSP`, so pushing to "the stack" there
+  saves onto the wrong one. This is the first bug everyone writes.
+- **Why PendSV, not SysTick directly.** SysTick can fire while a device ISR is running.
+  If SysTick did the switch, it would "return" into a task while that ISR is still
+  half-finished on the MSP. PendSV at the *lowest* priority (same 15 as SysTick) is
+  guaranteed to run only when no other handler is active, and tail-chains straight
+  after SysTick with no extra thread-mode round trip. SysTick's job is to *decide* and
+  set `SCB->ICSR` `PENDSVSET`; PendSV's job is to *do*. Set both priorities
+  explicitly; the SysTick one is already 15 from Phase 1.
+- **A fabricated first frame.** A task that has never run must look, to the restore
+  path, exactly like a task that was interrupted at its entry point. So its stack is
+  pre-painted with a 16-word frame: `xPSR` with **bit 24 (T) set** - `0x01000000` -
+  or the first return takes `INVSTATE`; `PC` = the task function; `LR` = somewhere
+  safe to land if the task ever returns (a trap, not garbage); `R0-R3, R12, R4-R11` =
+  anything, and recognisable patterns (`0x04040404` in R4, etc.) make a wrong-order
+  frame obvious in `x/16wx`. The saved `PSP` for that task points at the *bottom* of
+  this frame (lowest address), because the restore pops upward.
+- **Alignment.** The stacks are `static` arrays in `.bss`, 8-byte aligned
+  (`aligned(8)`), size a multiple of 8. The frame is 64 bytes so alignment survives a
+  switch, but a task that calls `printf` needs several hundred bytes of headroom -
+  budget 512 B each for Phase 2, or keep `printf` out of the tasks and observe via
+  GDB. Reuse the `.if`/`.error` trick from `startup.s` (or `_Static_assert` in C) for
+  the size and alignment.
+- **The handler must be `naked`.** A normal C function gets a compiler prologue that
+  pushes registers and may move `SP`. In the switcher that prologue lands on the MSP
+  between exception entry and your code, corrupting the frame arithmetic. `naked`
+  means the body is *only* what you write, in inline assembly, and must end with its
+  own `bx lr`. Block moves (`STMDB`/`LDMIA` with writeback) save/restore `R4-R11` in
+  one instruction each; look up what the `!` writeback does before using it.
+- **Bootstrapping the first task.** `main` runs on the MSP. The first task must start
+  on the PSP with `CONTROL.SPSEL` set, and there is no "previous task" to save. Two
+  honest options: (a) set `PSP` to task 1's pre-painted frame, set `CONTROL`, `ISB`,
+  and make the switcher's save path skip when "current" is null; or (b) trigger the
+  very first switch via `SVC` so the hardware performs a real exception return into
+  the fake frame. Pick one and say why - both are defensible, and Phase 3's `os_start`
+  is exactly this decision made permanent. Whatever is chosen, `ISB` after any write to
+  `CONTROL` is mandatory (ARMv7-M ARM B1.4.4).
+
+**Verification plan (decide it before writing the handler):**
+
+- Watchpoint on the current-task pointer - the single most useful tool in the project.
+  It halts on every switch at full speed; `bt` and `x/16wx $psp` from there.
+- Break inside PendSV: `print/x $lr` must be `0xfffffffd`; `print/x $control` must
+  show SPSEL. `x/8wx $psp` should decode as the hardware frame with an odd `PC` and
+  `0x01000000` in `xPSR`.
+- Each task keeps a `volatile` local counter *and* a distinct `R4-R11` footprint
+  (e.g. a `register` variable or just a nested call chain). After a few hundred
+  switches, both counters advance monotonically and neither has skipped or repeated -
+  that is the "resumed exactly" proof.
+- Measure nothing yet. `DWT->CYCCNT` and `-O2` numbers are Phase 8.
+
+**Faults to expect, in the order they usually appear:**
+`INVSTATE` UsageFault (T bit clear in the fake `xPSR`, or a vector/PC with bit 0
+clear) -> HardFault from a garbage `PC` (frame word order wrong; count from the
+*low* address: `R0` first, `xPSR` last) -> `INVPC` (EXC_RETURN clobbered, usually
+by a non-naked handler or by using `LR` as scratch) -> silent corruption (saved
+`R4-R11` on the MSP instead of the PSP - the *worst* one, because it works until it
+doesn't). `compare-sections` clean before decoding any of them.
+
+**Reading order:** Yiu ch. 8 (exceptions) and ch. 10 (the switch, "OS support
+features") first; Samek lessons 22-23 (two-thread hand switch, then PendSV); the
+ARMv7-M ARM B1.5 for the stacking rules when Yiu is ambiguous. **FreeRTOS `port.c`
+only after the switch works.**
+
+**Prep before touching the switcher:** none required. `printf` inside tasks is a
+stack-budget decision, not a blocker; the `uart.c` rounding/asserts and the PLL are
+explicitly after Phase 2.
 
 ---
 
@@ -794,8 +929,8 @@ Do not derive the SysTick reload value from `SystemCoreClock` — see the note i
 | Phase | Content | Est. | Status |
 |---|---|---|---|
 | **0** | Toolchain, own startup/linker/Makefile, blinky on PA5, GDB, `printf` | weekend | ✅ **done** |
-| **1** | SysTick at 1 kHz + tick counter, GPIO driver, `delay_ticks()` spinning on ticks | weekend | steps 1–2 ✅ — step 3 ← **here** |
-| **2** | **The context switch.** Two hardcoded tasks alternating on SysTick. No scheduler, no priorities. Prove a task can be left mid-execution and resumed exactly | the hard part |
+| **1** | SysTick at 1 kHz + tick counter, GPIO driver, `delay_ticks()` spinning on ticks | weekend | ✅ **done** (2026-09-10) |
+| **2** | **The context switch.** Two hardcoded tasks alternating on SysTick. No scheduler, no priorities. Prove a task can be left mid-execution and resumed exactly | the hard part | ← **here** |
 | **3** | Task Control Blocks, stack initialization, a real round-robin scheduler, `os_start()` | 1 wk |
 | **4** | Task states (READY/RUNNING/BLOCKED/SUSPENDED), `os_delay()` that yields instead of spinning, fixed-priority preemption, `os_yield()` | 1–2 wk |
 | **5** | Critical sections (nestable), counting semaphore, mutex with **priority inheritance** — implement the inversion bug first, observe it on a scope, then fix it | 1–2 wk |
