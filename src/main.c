@@ -5,6 +5,7 @@
 #include "uart.h"
 #include "systick.h"
 #include "delay.h"
+#include "gpio.h"
 
 // golden variables to populate the .data and .bss sections
 volatile uint32_t golden_data = 0xDEADBEEF; // This variable is initialized and should be in .data
@@ -19,7 +20,7 @@ extern uint32_t _edata;  // end address for the .data section
 extern uint8_t _sbss; // Start of .bss in RAM
 extern uint8_t _ebss; // End of .bss in RAM
 
-bool is_data_properly_initialized(void) {
+static bool is_data_properly_initialized(void) {
     // Test 1: Fail if .data range is zero or inverted
     if (&_sdata >= &_edata) {
         return false; 
@@ -32,7 +33,7 @@ bool is_data_properly_initialized(void) {
     return true; // Success: The golden_data variable is properly initialized
 }
 
-bool is_bss_properly_zeroed(void) {
+static bool is_bss_properly_zeroed(void) {
     if(golden_bss != 0) return false; // Fail: The golden_bss variable was not properly zeroed (non circular)
 
     // catches partial zero
@@ -56,16 +57,8 @@ int main(void){
         while(1); 
     }
 
-    RCC->AHBENR |= RCC_AHBENR_GPIOAEN; // Enable GPIOA clock
-    /*
-        MODER is one register covering all 16 pins of port A, 2 bits each.
-        Read-modify-write so we touch only PA5's field. a plain assignment
-        would clobber PA13/PA14 and nuke SWD.
-        Two steps because |= can't turn a 1 into a 0: if the field currently
-        holds 11 (analog), OR-ing 01 leaves it at 11.
-    */
-    GPIOA->MODER &= ~(GPIO_MODER_MODER5_Msk); // Clear mode bits for pin 5
-    GPIOA->MODER |= (1 << GPIO_MODER_MODER5_Pos); // Set pin 5 to output mode
+    // never set after uart init, the GPIOA clock needs to be enabled before initializing the UART2 peripheral, which uses GPIOA pins for TX and RX.
+    gpio_init_output(GPIOA, 5); // Initialize PA5 as output
     
     uart2_init();
     systick_init();
@@ -78,8 +71,10 @@ int main(void){
         // Main loop
         counter += 1;
         printf("%d\r\n", counter);
-        GPIOA->ODR ^= GPIO_ODR_5; // Toggle PA5 (LED)
+        gpio_write_pin(GPIOA, 5, GPIO_HIGH); // Set PA5 high
         // Add a simple delay to make the LED toggle visible
+        delay_ticks(MS_TO_TICKS(250)); // Delay for 250 milliseconds
+        gpio_write_pin(GPIOA, 5, GPIO_LOW); // Set PA5 low
         delay_ticks(MS_TO_TICKS(250)); // Delay for 250 milliseconds
     }
 }

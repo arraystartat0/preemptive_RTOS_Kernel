@@ -17,6 +17,7 @@ CFLAGS += -ffunction-sections -fdata-sections
 CFLAGS += -MMD -MP
 CFLAGS += -Icmsis/Include -Icmsis/Device/ST/STM32F3xx/Include
 CFLAGS += -DSTM32F302x8
+CFLAGS += -Wmissing-prototypes
 
 LDFLAGS  = $(ARCH)
 LDFLAGS += -T linker.ld --specs=nano.specs --specs=nosys.specs -Wl,--gc-sections

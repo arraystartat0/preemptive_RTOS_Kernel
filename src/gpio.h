@@ -1,6 +1,6 @@
 #pragma once
 #include <stdint.h>
-#include "stm32f302x8.h" //device header
+#include "stm32f3xx.h" //dispatcher
 
 typedef enum {
     GPIO_HIGH = 1,

@@ -9,6 +9,9 @@ void delay_ticks(uint32_t ticks) {
     if (!is_systick_initialized()) {
         // If SysTick is not initialized, we cannot perform a delay
         __BKPT(0); // Trigger a breakpoint for debugging purposes
+        while(1) {
+            // Infinite loop to halt execution
+        }
     }
     uint32_t start_tick = systick_get_tick_count(); // Get the current value of the SysTick timer
     uint32_t elapsed_ticks = 0; // Initialize elapsed ticks to zero
